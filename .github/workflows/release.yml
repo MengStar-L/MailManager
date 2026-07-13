@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Test and build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Release tags must have the form vX.Y.Z without leading zeroes" >&2
+            exit 1
+          fi
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Run Go tests
+        run: go test ./...
+
+      - name: Install frontend dependencies
+        run: npm ci --prefix web
+
+      - name: Run frontend tests
+        run: npm test --prefix web -- --reporter=dot
+
+      - name: Install Playwright browser
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+
+      - name: Run end-to-end tests
+        working-directory: web
+        env:
+          PLAYWRIGHT_PORT: "4176"
+        run: npm run test:e2e
+
+      - name: Build release assets
+        env:
+          SKIP_NPM_CI: "1"
+        run: sh scripts/build-release.sh
+
+      - name: Verify release checksums
+        working-directory: dist
+        run: sha256sum --check checksums.txt
+
+      - name: Verify native release version
+        shell: bash
+        run: |
+          chmod 0755 dist/mailmanager-linux-amd64
+          actual_version=$(
+            dist/mailmanager-linux-amd64 version --json |
+              node -e 'const fs=require("node:fs"); const value=JSON.parse(fs.readFileSync(0,"utf8")); process.stdout.write(value.version)'
+          )
+          test "$actual_version" = "$VERSION"
+
+      - name: Pack release artifact
+        run: tar -C dist -czf release-assets.tar.gz .
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-assets
+          path: release-assets.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-assets
+          path: artifact
+
+      - name: Extract and verify release assets
+        shell: bash
+        run: |
+          mkdir dist
+          tar -xzf artifact/release-assets.tar.gz -C dist
+          cd dist
+          sha256sum --check checksums.txt
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --verify-tag
+          --generate-notes
+          --title "MailManager $GITHUB_REF_NAME"
