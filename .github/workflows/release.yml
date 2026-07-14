@@ -140,6 +140,7 @@ jobs:
             --public-url https://mail.example.com \
             --yes
 
+          set -x
           systemctl is-active --quiet mailmanager.service
           systemctl is-active --quiet mailmanager-updater.path
           curl --fail --silent http://127.0.0.1:8080/readyz >/dev/null
