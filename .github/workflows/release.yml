@@ -144,14 +144,14 @@ jobs:
           systemctl is-active --quiet mailmanager.service
           systemctl is-active --quiet mailmanager-updater.path
           curl --fail --silent http://127.0.0.1:8080/readyz >/dev/null
-          test -s "$install_root/data/bootstrap-token"
-          test "$(stat -c '%U:%G %a' "$install_root/config")" = 'root:mailmanager 750'
-          test "$(stat -c '%U:%G %a' "$install_root/config/mailmanager.env")" = 'root:mailmanager 640'
-          test "$(stat -c '%U:%G %a' "$install_root/config/master.key")" = 'mailmanager:mailmanager 600'
-          test "$(stat -c '%U:%G %a' "$install_root/data")" = 'mailmanager:mailmanager 700'
-          test "$(stat -c '%U:%G %a' "$install_root/updater")" = 'root:mailmanager 2750'
+          sudo test -s "$install_root/data/bootstrap-token"
+          test "$(sudo stat -c '%U:%G %a' "$install_root/config")" = 'root:mailmanager 750'
+          test "$(sudo stat -c '%U:%G %a' "$install_root/config/mailmanager.env")" = 'root:mailmanager 640'
+          test "$(sudo stat -c '%U:%G %a' "$install_root/config/master.key")" = 'mailmanager:mailmanager 600'
+          test "$(sudo stat -c '%U:%G %a' "$install_root/data")" = 'mailmanager:mailmanager 700'
+          test "$(sudo stat -c '%U:%G %a' "$install_root/updater")" = 'root:mailmanager 2750'
           grep -F "ExecStart=$install_root/bin/mailmanager serve" /etc/systemd/system/mailmanager.service
-          grep -F 'server_name mail.example.com;' "$install_root/config/nginx.conf.example"
+          sudo grep -F 'server_name mail.example.com;' "$install_root/config/nginx.conf.example"
 
       - name: Pack release artifact
         run: tar -C dist -czf release-assets.tar.gz .
