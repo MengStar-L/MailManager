@@ -23,7 +23,7 @@ default_output=$(sh "$INSTALLER" --dry-run --public-url https://mail.example.com
 printf '%s\n' "$default_output" | grep -F "安装目录:   /opt/mailmanager" >/dev/null || fail "default root missing"
 printf '%s\n' "$default_output" | grep -F "立即启动:   yes" >/dev/null || fail "default start state missing"
 
-custom_root="$TMP_DIR/custom-mailmanager"
+custom_root="/srv/mailmanager-test-$$"
 custom_output=$(sh "$INSTALLER" --dry-run --install-dir "$custom_root" --public-url https://mail.example.com:8443 --no-start --yes)
 printf '%s\n' "$custom_output" | grep -F "配置文件:   $custom_root/config/mailmanager.env" >/dev/null || fail "custom config path missing"
 printf '%s\n' "$custom_output" | grep -F "更新目录:   $custom_root/updater" >/dev/null || fail "custom updater path missing"
