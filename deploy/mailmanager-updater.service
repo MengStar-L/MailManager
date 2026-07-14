@@ -2,14 +2,14 @@
 Description=Download, verify, and install a MailManager update
 Wants=network-online.target
 After=network-online.target
-ConditionPathExists=/var/lib/mailmanager-updater/inbox/request.json
+ConditionPathExists=/opt/mailmanager/updater/inbox/request.json
 
 [Service]
 Type=oneshot
 User=root
 Group=mailmanager
-EnvironmentFile=-/etc/mailmanager/mailmanager.env
-WorkingDirectory=/var/lib/mailmanager-updater
+EnvironmentFile=-/opt/mailmanager/config/mailmanager.env
+WorkingDirectory=/opt/mailmanager/updater
 ExecStart=/opt/mailmanager/bin/mailmanager update-apply
 TimeoutStartSec=30min
 TimeoutStopSec=3min
@@ -26,8 +26,8 @@ ProtectKernelLogs=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectSystem=strict
-ReadOnlyPaths=/etc/mailmanager
-ReadWritePaths=/opt/mailmanager/bin /var/lib/mailmanager-updater
+ReadOnlyPaths=/opt/mailmanager/config
+ReadWritePaths=/opt/mailmanager/bin /opt/mailmanager/updater
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=true
 RestrictRealtime=true

@@ -24,6 +24,12 @@ func TestLoadDefaults(t *testing.T) {
 	if filepath.Dir(cfg.DatabasePath) != cfg.DataDir {
 		t.Fatalf("database path %q is outside data dir %q", cfg.DatabasePath, cfg.DataDir)
 	}
+	expectedInbox, _ := filepath.Abs(filepath.FromSlash("/opt/mailmanager/updater/inbox"))
+	expectedState, _ := filepath.Abs(filepath.FromSlash("/opt/mailmanager/updater/status.json"))
+	expectedInstalled, _ := filepath.Abs(filepath.FromSlash("/opt/mailmanager/updater/installed-version"))
+	if cfg.UpdateInboxDir != expectedInbox || cfg.UpdateStatePath != expectedState || cfg.UpdateInstalledVersionPath != expectedInstalled {
+		t.Fatalf("unexpected updater defaults: %+v", cfg)
+	}
 }
 
 func TestLoadProductionURLAndDurations(t *testing.T) {

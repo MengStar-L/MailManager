@@ -49,6 +49,13 @@ jobs:
       - name: Run Go tests
         run: go test ./...
 
+      - name: Validate Linux deployment scripts
+        shell: bash
+        run: |
+          sh -n scripts/install-linux.sh scripts/install-linux_test.sh scripts/build-release.sh
+          sh scripts/install-linux_test.sh
+          shellcheck scripts/install-linux.sh scripts/install-linux_test.sh scripts/build-release.sh
+
       - name: Install frontend dependencies
         run: npm ci --prefix web
 
@@ -74,6 +81,19 @@ jobs:
         working-directory: dist
         run: sha256sum --check checksums.txt
 
+      - name: Verify systemd templates
+        shell: bash
+        run: |
+          root=$(mktemp -d /tmp/mailmanager-systemd.XXXXXX)
+          trap 'rm -rf -- "$root"' EXIT
+          install -d "$root/bin" "$root/config" "$root/data" "$root/updater/inbox"
+          install -m 0755 /bin/true "$root/bin/mailmanager"
+          install -m 0644 deploy/mailmanager.env.example "$root/config/mailmanager.env"
+          sed "s|/opt/mailmanager|$root|g" deploy/mailmanager.service > "$root/mailmanager.service"
+          sed "s|/opt/mailmanager|$root|g" deploy/mailmanager-updater.service > "$root/mailmanager-updater.service"
+          sed "s|/opt/mailmanager|$root|g" deploy/mailmanager-updater.path > "$root/mailmanager-updater.path"
+          systemd-analyze verify "$root/mailmanager.service" "$root/mailmanager-updater.service" "$root/mailmanager-updater.path"
+
       - name: Verify native release version
         shell: bash
         run: |
@@ -83,6 +103,54 @@ jobs:
               node -e 'const fs=require("node:fs"); const value=JSON.parse(fs.readFileSync(0,"utf8")); process.stdout.write(value.version)'
           )
           test "$actual_version" = "$VERSION"
+
+      - name: Smoke test Linux installation
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_root=/opt/mailmanager-smoke
+          server_pid=
+          cleanup() {
+            sudo systemctl disable --now mailmanager-updater.path mailmanager.service >/dev/null 2>&1 || true
+            sudo rm -f /etc/systemd/system/mailmanager.service \
+              /etc/systemd/system/mailmanager-updater.service \
+              /etc/systemd/system/mailmanager-updater.path \
+              /usr/local/bin/mailmanager
+            sudo rm -rf -- "$install_root"
+            sudo systemctl daemon-reload
+            if [ -n "$server_pid" ]; then kill "$server_pid" >/dev/null 2>&1 || true; fi
+          }
+          trap cleanup EXIT
+
+          python3 -m http.server 18080 --bind 127.0.0.1 --directory dist >/tmp/mailmanager-assets.log 2>&1 &
+          server_pid=$!
+          for _ in $(seq 1 20); do
+            curl --fail --silent http://127.0.0.1:18080/checksums.txt >/dev/null && break
+            sleep 0.25
+          done
+          curl --fail --silent http://127.0.0.1:18080/checksums.txt >/dev/null
+
+          sed \
+            -e '/^RELEASE_URL=/c\RELEASE_URL="http://127.0.0.1:18080"' \
+            -e "s/--proto '=https'/--proto '=http,https'/g" \
+            scripts/install-linux.sh > /tmp/install-mailmanager-smoke.sh
+          sudo sh /tmp/install-mailmanager-smoke.sh \
+            --version "$GITHUB_REF_NAME" \
+            --install-dir "$install_root" \
+            --public-url https://mail.example.com \
+            --yes
+
+          systemctl is-active --quiet mailmanager.service
+          systemctl is-active --quiet mailmanager-updater.path
+          curl --fail --silent http://127.0.0.1:8080/readyz >/dev/null
+          test -s "$install_root/data/bootstrap-token"
+          test "$(stat -c '%U:%G %a' "$install_root/config")" = 'root:mailmanager 750'
+          test "$(stat -c '%U:%G %a' "$install_root/config/mailmanager.env")" = 'root:mailmanager 640'
+          test "$(stat -c '%U:%G %a' "$install_root/config/master.key")" = 'mailmanager:mailmanager 600'
+          test "$(stat -c '%U:%G %a' "$install_root/data")" = 'mailmanager:mailmanager 700'
+          test "$(stat -c '%U:%G %a' "$install_root/updater")" = 'root:mailmanager 2750'
+          grep -F "ExecStart=$install_root/bin/mailmanager serve" /etc/systemd/system/mailmanager.service
+          grep -F 'server_name mail.example.com;' "$install_root/config/nginx.conf.example"
 
       - name: Pack release artifact
         run: tar -C dist -czf release-assets.tar.gz .

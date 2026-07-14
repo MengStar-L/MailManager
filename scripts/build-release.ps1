@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.0.0",
+    [string]$Version = "1.1.0",
     [switch]$SkipNpmInstall
 )
 
@@ -78,6 +78,7 @@ $ReleaseFiles = @{
     (Join-Path $Root "deploy/mailmanager-updater.service") = "mailmanager-updater.service"
     (Join-Path $Root "deploy/mailmanager-updater.path") = "mailmanager-updater.path"
     (Join-Path $Root "deploy/mailmanager.env.example") = "mailmanager.env.example"
+    (Join-Path $Root "deploy/nginx.conf.example") = "nginx.conf.example"
     (Join-Path $Root "scripts/install-linux.sh") = "install-linux.sh"
 }
 foreach ($Source in $ReleaseFiles.Keys) {

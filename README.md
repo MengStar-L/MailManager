@@ -1,144 +1,178 @@
-# MailManager
+<p align="center">
+  <img src="./web/public/favicon.svg" width="96" alt="MailManager logo">
+</p>
 
-MailManager 是一个面向个人自托管场景的多邮箱 Web 客户端。它把 Gmail、Outlook、QQ、163、企业邮箱和通用 IMAP/SMTP 账户集中到统一收件箱，同时保留清晰的账户归属、跨账户搜索、会话阅读、撰写、草稿、附件和批量整理能力。
+<h1 align="center">MailManager</h1>
 
-后端是 Go 模块化单体，前端 React 资源嵌入同一个二进制。正式环境只监听本机 HTTP，由 Nginx 终止 HTTPS。
+<p align="center">
+  <strong>把分散在不同服务商的邮箱，收进一个安静、清晰的私人邮件工作台。</strong>
+</p>
 
-## 本地开发
+<p align="center">
+  <img alt="Latest release" src="https://img.shields.io/github/v/release/MengStar-L/MailManager?style=for-the-badge&label=Release&color=0f766e">
+  <img alt="Linux" src="https://img.shields.io/badge/Linux-systemd-34495e?style=for-the-badge&logo=linux&logoColor=white">
+  <img alt="Architecture" src="https://img.shields.io/badge/Arch-amd64%20%7C%20arm64-2563eb?style=for-the-badge">
+  <img alt="Go" src="https://img.shields.io/badge/Go-1.26-00ADD8?style=for-the-badge&logo=go&logoColor=white">
+  <img alt="React" src="https://img.shields.io/badge/React-19-087EA4?style=for-the-badge&logo=react&logoColor=white">
+</p>
 
-需要 Go 1.26、Node.js 24 和 npm 11。
+<p align="center">
+  <a href="#快速部署">快速部署</a>
+  ·
+  <a href="#功能特性">功能特性</a>
+  ·
+  <a href="#支持的邮箱">支持的邮箱</a>
+  ·
+  <a href="#产品截图">产品截图</a>
+  ·
+  <a href="#自动更新">自动更新</a>
+  ·
+  <a href="#常见问题">常见问题</a>
+</p>
 
-```powershell
-npm ci --prefix web
-npm run build --prefix web
-go run ./cmd/mailmanager serve
-```
+---
 
-默认地址为 `http://127.0.0.1:8080`。首次启动会在 `data/bootstrap-token` 写入权限受限的一次性初始化令牌；网页完成管理员密码、TOTP 和恢复码配置后，该文件会自动删除。
+<p align="center">
+  <img src="./docs/images/overview.webp" alt="MailManager 桌面端统一收件箱与邮件阅读界面">
+</p>
 
-前端热更新模式：
+MailManager 是一个适合长期运行在私人 Linux 服务器上的多邮箱 Web 客户端。它把 Gmail、Outlook、QQ、163 和其他 IMAP/SMTP 邮箱放到同一个界面中，让你在一个收件箱里阅读、搜索、回复、写信和整理邮件。
 
-```powershell
-npm run dev --prefix web
-go run ./cmd/mailmanager serve
-```
+前端、后台同步和管理页面都包含在同一个二进制中。服务器只需要运行一个 systemd 服务，日常更新也可以直接在网页中完成。
 
-Vite 会把 `/api`、`/healthz` 和 `/readyz` 代理到 Go 服务。
+## 功能特性
 
-## 测试与发布
+| 统一管理 | 阅读与整理 | 写信与草稿 |
+| --- | --- | --- |
+| 多账户统一收件箱，并保留清晰的账户归属 | 会话阅读、全文搜索、星标、归档、回收站与批量操作 | 内联写信、回复、回复全部、转发、附件和自动保存草稿 |
 
-```powershell
-go test ./...
-npm test --prefix web -- --run
-npm run test:e2e --prefix web
-./scripts/build-release.ps1 -Version 1.0.0
-```
+| 安全访问 | 响应式界面 | 网页更新 |
+| --- | --- | --- |
+| 管理员密码、TOTP、恢复码、受保护的凭据与严格同源校验 | 桌面、平板和手机使用同一套完整功能 | 检查 GitHub 稳定版，一次点击完成校验、安装、重启和失败回滚 |
 
-Linux/macOS 可运行 `VERSION=1.0.0 sh ./scripts/build-release.sh`。两个脚本都会构建前端，输出 Linux amd64/arm64 二进制、systemd units、安装脚本和 `checksums.txt` 到 `dist/`。
+## 支持的邮箱
 
-推送格式为 `vX.Y.Z` 且各段没有前导零的标签会触发 GitHub Actions：只读权限的构建任务运行 Go、前端单元测试、完整 E2E 和生产构建，再由独立发布任务取得写权限并创建 Release。例如首次发布：
+| 邮箱 | 接入方式 | 使用前准备 |
+| --- | --- | --- |
+| Gmail | OAuth 2.0 | 配置 Google OAuth 应用与 HTTPS 回调地址 |
+| Outlook / Microsoft 365 | OAuth 2.0 | 配置 Microsoft OAuth 应用与 HTTPS 回调地址 |
+| QQ 邮箱 | IMAP/SMTP | 在邮箱设置中开启服务并生成授权码 |
+| 163 邮箱 | IMAP/SMTP | 开启 IMAP/SMTP 并使用客户端授权密码 |
+| 企业邮箱及其他服务商 | 通用 IMAP/SMTP | 准备服务器地址、端口、TLS 模式和应用密码 |
+
+> OAuth 回调地址由安装时填写的公开 HTTPS 地址生成。部署完成后不要随意更换 `MAILMANAGER_PUBLIC_URL`，否则登录来源校验和 OAuth 回调会不一致。
+
+## 快速部署
+
+开始前请准备：
+
+- 一台使用 systemd 的 Linux 服务器，架构为 amd64 或 arm64。
+- 一个已解析到服务器的域名，以及该域名的有效 HTTPS 证书。
+- Nginx 或其他可以把 HTTPS 反向代理到 `127.0.0.1:8080` 的 Web 服务器。
+- root 或 sudo 权限。
+
+执行下面的命令：
 
 ```bash
-git tag -a v1.0.0 -m "MailManager v1.0.0"
-git push origin v1.0.0
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://github.com/MengStar-L/MailManager/releases/latest/download/install-linux.sh \
+  -o /tmp/install-mailmanager.sh && \
+sudo sh /tmp/install-mailmanager.sh
 ```
 
-## Linux 部署
+安装向导只会询问两项内容：
 
-首次安装需要从可信的 GitHub Release 手动引导一次。先从同一个固定标签下载校验清单和安装脚本，确认脚本的 SHA-256 后再交给 root 执行：
+1. 安装目录，直接回车使用 `/opt/mailmanager`。
+2. 完整 HTTPS 地址，例如 `https://mail.example.com`。
 
-```bash
-VERSION=v1.0.0
-BASE="https://github.com/MengStar-L/MailManager/releases/download/$VERSION"
-curl --proto '=https' --tlsv1.2 -fL \
-  -o checksums.txt "$BASE/checksums.txt"
-curl --proto '=https' --tlsv1.2 -fL \
-  -o install-linux.sh "$BASE/install-linux.sh"
-awk '$2 == "install-linux.sh" { print }' checksums.txt > install-linux.sha256
-test "$(wc -l < install-linux.sha256)" -eq 1
-sha256sum --check install-linux.sha256
-sudo sh install-linux.sh --version "$VERSION" --no-start
-sudoedit /etc/mailmanager/mailmanager.env
-sudo systemctl restart mailmanager.service mailmanager-updater.path
+确认后，脚本会自动识别服务器架构、下载稳定版、校验 SHA-256、生成主密钥、注册 systemd 服务并启动 MailManager。
+
+默认目录如下：
+
+```text
+/opt/mailmanager/
+├── bin/          程序与上一版本备份
+├── config/       环境配置、主密钥和 Nginx 示例
+├── data/         数据库、草稿与附件缓存
+└── updater/      自动更新状态、工作区与回滚备份
 ```
 
-这项 SHA-256 校验能发现下载损坏或脚本与清单不一致，但清单和脚本来自同一 GitHub Release；仓库管理员凭据或 Release 发布链路同时失陷时，它不能替代独立数字签名。
+systemd 单元会安装到 `/etc/systemd/system`，命令行入口会链接到 `/usr/local/bin/mailmanager`。如果在向导中选择了其他安装目录，上述四个子目录会一起移动。
 
-安装脚本支持 amd64 和 arm64，会把真实二进制安装到 `/opt/mailmanager/bin/mailmanager`，并仅在 `/usr/local/bin/mailmanager` 创建 CLI 链接。它会创建受限服务用户和更新目录，使用 `/dev/urandom` 生成原始 32 字节主密钥，并保留已有数据、密钥和非更新配置。`--no-start` 不执行候选二进制，也不进行健康检查；升级时旧二进制保留在 `/opt/mailmanager/bin/mailmanager.previous`，确认配置后再重启。
+### 完成首次初始化
 
-`MAILMANAGER_PUBLIC_URL` 必须改成真实 HTTPS 域名。正常启动并通过健康检查后，期望版本会写入 root 所有、组只读的 `/var/lib/mailmanager-updater/installed-version`；使用 `--no-start` 时该标记记录已暂存、等待人工重启验证的版本。
+1. 按照 [`docs/deployment.md`](./docs/deployment.md) 配置 HTTPS 反向代理。安装器生成的示例位于 `/opt/mailmanager/config/nginx.conf.example`。
+2. 读取一次性初始化令牌：
 
-复制 `deploy/nginx.conf.example` 到 Nginx 配置，替换域名和证书路径。SSE 路径必须保持 `proxy_buffering off`。完成后通过 `sudo cat /var/lib/mailmanager/bootstrap-token` 获取初始化令牌并访问公开 HTTPS 地址。
+   ```bash
+   sudo cat /opt/mailmanager/data/bootstrap-token
+   ```
 
-应用进程只监听 `127.0.0.1:8080`。不要把该端口直接暴露到公网。
+3. 打开安装时填写的 HTTPS 地址，设置管理员密码、TOTP 和恢复码。
+4. 进入“设置 → 邮箱账户”，添加需要统一管理的邮箱。
+
+## 产品截图
+
+<table>
+  <tr>
+    <td width="67%"><img src="./docs/images/composer.webp" alt="MailManager 内联写信界面"></td>
+    <td width="33%"><img src="./docs/images/mobile.webp" alt="MailManager 手机端邮件阅读界面"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>在阅读区直接写信，草稿自动保存</strong></td>
+    <td align="center"><strong>手机端保留完整阅读体验</strong></td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="./docs/images/system-update.webp" alt="MailManager 网页系统更新界面">
+  <br>
+  <strong>在网页中检查稳定版本并完成更新与重启</strong>
+</p>
 
 ## 自动更新
 
-正式二进制每 6 小时检查 `MengStar-L/MailManager` 的最新稳定 Release；不会跟随 `main`、草稿版或预发布版本，也不会自行安装。管理员在网页“设置 -> 系统更新”确认后，主服务只向 `/var/lib/mailmanager-updater/inbox` 写请求，由 root 权限的 `mailmanager-updater.path` 启动一次性更新服务。
+MailManager 每 6 小时检查一次最新稳定 GitHub Release，不跟随 `main`、草稿版或预发布版本，也不会在无人确认时自动安装。
 
-更新器会重新确认 Release、校验 SHA-256、备份旧二进制并重启 `mailmanager.service`。`/readyz` 在 60 秒内未恢复时会自动还原旧二进制；首次安装器也会进行有界就绪探测并在升级失败时恢复 `/opt/mailmanager/bin/mailmanager.previous`。数据库不会自动备份或回滚，因此升级前仍应完成数据备份。SQLite 迁移只向前执行，若新版本已经执行不兼容迁移，二进制回滚后可能仍需从运维备份恢复数据库。
+发现新版本后，管理员可以在“设置 → 系统更新”查看版本说明并开始更新。更新器会校验 SHA-256、备份当前二进制、重启服务并检查 `/readyz`；如果新版本无法恢复服务，会自动换回上一版二进制。
 
-官方 units 假定真实二进制位于 `/opt/mailmanager/bin/mailmanager`。如需更改路径，必须同时修改 `MAILMANAGER_UPDATE_BINARY_PATH`、`mailmanager.service` 和 `mailmanager-updater.service` 的 `ExecStart`，并用 drop-in 同步 updater 的 `ReadWritePaths`；只改环境变量会导致更新失败。`MAILMANAGER_UPDATE_INSTALLED_VERSION_FILE` 同样必须指向 updater 可写、主服务可读的位置。
+数据库迁移只向前执行，因此重要更新前仍建议备份整个 `config/` 和 `data/`。完整步骤见 [`docs/operations.md`](./docs/operations.md)。
 
-`MAILMANAGER_UPDATE_READY_URL` 必须与 `MAILMANAGER_ADDR` 的监听地址和端口一致。例如 `MAILMANAGER_ADDR=127.0.0.1:9090` 时应设置为 `http://127.0.0.1:9090/readyz`，否则成功启动也会被判定为更新失败。
+## 常见问题
 
-```bash
-systemctl status mailmanager-updater.path
-journalctl -u mailmanager-updater.service
-cat /var/lib/mailmanager-updater/status.json
-```
+<details>
+<summary><strong>为什么必须填写 HTTPS 地址？</strong></summary>
 
-将 `/etc/mailmanager/mailmanager.env` 中的 `MAILMANAGER_AUTO_UPDATE_ENABLED` 设为 `false` 可关闭网页安装能力；版本信息和手动检查仍会显示。
+MailManager 使用固定公开地址进行 Cookie 安全判断、写请求同源校验和 OAuth 回调。生产环境必须使用真实 HTTPS 域名，不能直接暴露本机的 `8080` 端口。
+</details>
 
-## OAuth
+<details>
+<summary><strong>安装后网页打不开怎么办？</strong></summary>
 
-Google 和 Microsoft 账户需要为当前部署自行创建 Web OAuth 应用：
+先运行 `sudo systemctl status mailmanager.service` 和 `curl http://127.0.0.1:8080/readyz`。如果本机服务正常，问题通常位于域名解析、证书或 Nginx 配置。详细检查命令见 [`docs/operations.md`](./docs/operations.md)。
+</details>
 
-- Google 回调：`https://你的域名/api/v1/oauth/google/callback`
-- Microsoft 回调：`https://你的域名/api/v1/oauth/microsoft/callback`
+<details>
+<summary><strong>可以安装到其他目录吗？</strong></summary>
 
-Client ID 与 Client Secret 在“设置 -> 邮箱账户”中填写；Secret 和 refresh token 使用主密钥加密，读取 API 永不返回 Secret。Google 外部应用处于 Testing 状态时 refresh token 可能只有 7 天有效期，长期运行应按 Google 控制台要求发布应用。
+可以。安装向导会先询问根目录，也可以使用 `--install-dir /srv/mailmanager`。配置、数据和更新器会一起放在该目录下，systemd 单元会自动使用新路径。
+</details>
 
-QQ、163 和多数企业邮箱使用邮箱后台生成的授权码或应用密码，不应填写网页登录密码。
+<details>
+<summary><strong>邮件凭据如何保存？</strong></summary>
 
-## 数据与备份
+邮箱密码、授权码和 OAuth Token 会使用服务器上的主密钥加密。SQLite 中的邮件正文和搜索索引不是应用层密文，建议服务器磁盘使用 LUKS、fscrypt 或等效加密方案。
+</details>
 
-SQLite 正文索引可搜索，因此数据库本身不是应用层密文。正式服务器应把 `/var/lib/mailmanager` 放在 LUKS、fscrypt 或等效加密卷上。
+## 更多文档
 
-必要备份包括：
+- [完整部署与 Nginx 配置](./docs/deployment.md)
+- [更新、备份、恢复与故障排查](./docs/operations.md)
+- [本地开发、测试和发版](./docs/development.md)
+- [最新稳定版本](https://github.com/MengStar-L/MailManager/releases/latest)
 
-- `/var/lib/mailmanager/mailmanager.db`
-- `/var/lib/mailmanager/draft-blobs/`
-- `/etc/mailmanager/mailmanager.env`
-- `/etc/mailmanager/master.key`
+---
 
-附件缓存 `/var/lib/mailmanager/attachments/` 可从邮箱服务器重建，不需要进入必要备份。数据库与主密钥应分开保存；丢失主密钥后邮箱凭据和 OAuth token 无法恢复。
-
-一致性备份流程：
-
-```bash
-sudo systemctl stop mailmanager
-sudo tar -C / -czf mailmanager-data.tar.gz var/lib/mailmanager/mailmanager.db var/lib/mailmanager/draft-blobs
-sudo tar -C / -czf mailmanager-secrets.tar.gz etc/mailmanager/mailmanager.env etc/mailmanager/master.key
-sudo systemctl start mailmanager
-```
-
-恢复时先停止服务，并分别恢复权限：`/var/lib/mailmanager` 数据目录及其内容为 `mailmanager:mailmanager`，`/etc/mailmanager/mailmanager.env` 为 `root:mailmanager 0640`，`/etc/mailmanager/master.key` 为 `mailmanager:mailmanager 0600`。然后再启动服务并检查 `/readyz`。
-
-## 安全边界
-
-- 管理员密码使用 Argon2id；登录必须通过 TOTP，恢复码仅可使用一次。
-- 邮箱凭据、OAuth token 和 TOTP 密钥使用 AES-256-GCM 逐条加密。
-- HTML 邮件经过白名单清洗并在 sandbox iframe 中显示；远程图片默认阻止。
-- IMAP/SMTP 仅允许 TLS 或 STARTTLS，不提供跳过证书校验选项。
-- 附件强制下载并限制为 25 MiB；缓存默认上限为 5 GiB。
-- 同机 root 用户仍可读取运行中的数据，这是单机自托管模型的明确边界。
-
-## 运维
-
-- 健康检查：`GET /healthz`
-- 就绪检查：`GET /readyz`
-- 日志：`journalctl -u mailmanager`
-- 手动同步：设置页账户菜单中的“立即同步”
-
-升级前先备份。替换二进制并重启后，Go 服务会自动执行只向前的 SQLite 迁移；不要用旧版本二进制直接打开已升级数据库。
+<p align="center">
+  <sub>让每个邮箱各司其职，让所有邮件在一个地方安静地抵达。</sub>
+</p>

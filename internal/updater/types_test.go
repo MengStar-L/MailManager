@@ -1,6 +1,9 @@
 package updater
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestCompareVersions(t *testing.T) {
 	tests := []struct {
@@ -34,5 +37,16 @@ func TestBinaryAssetName(t *testing.T) {
 	}
 	if _, ok := BinaryAssetName("386"); ok {
 		t.Fatal("386 must not be supported")
+	}
+}
+
+func TestDefaultInstallPathsShareRoot(t *testing.T) {
+	for name, value := range map[string]string{
+		"inbox": DefaultInboxDir, "state": DefaultStatePath, "installed": DefaultInstalledVersionPath,
+		"work": DefaultWorkDir, "backup": DefaultBackupDir, "binary": DefaultBinary,
+	} {
+		if !strings.HasPrefix(value, "/opt/mailmanager/") {
+			t.Fatalf("%s path %q is outside /opt/mailmanager", name, value)
+		}
 	}
 }

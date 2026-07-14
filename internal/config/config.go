@@ -100,9 +100,9 @@ func Load() (Config, error) {
 		AttachmentCacheMax:         cacheMax,
 		SecureCookies:              publicURL.Scheme == "https",
 		AutoUpdateEnabled:          autoUpdateEnabled,
-		UpdateInboxDir:             pathEnv("MAILMANAGER_UPDATE_INBOX_DIR", "/var/lib/mailmanager-updater/inbox"),
-		UpdateStatePath:            pathEnv("MAILMANAGER_UPDATE_STATE_FILE", "/var/lib/mailmanager-updater/status.json"),
-		UpdateInstalledVersionPath: pathEnv("MAILMANAGER_UPDATE_INSTALLED_VERSION_FILE", "/var/lib/mailmanager-updater/installed-version"),
+		UpdateInboxDir:             pathEnv("MAILMANAGER_UPDATE_INBOX_DIR", "/opt/mailmanager/updater/inbox"),
+		UpdateStatePath:            pathEnv("MAILMANAGER_UPDATE_STATE_FILE", "/opt/mailmanager/updater/status.json"),
+		UpdateInstalledVersionPath: pathEnv("MAILMANAGER_UPDATE_INSTALLED_VERSION_FILE", "/opt/mailmanager/updater/installed-version"),
 	}, nil
 }
 

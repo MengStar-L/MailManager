@@ -4,7 +4,7 @@ Wants=network-online.target
 After=network-online.target
 
 [Path]
-PathExists=/var/lib/mailmanager-updater/inbox/request.json
+PathExists=/opt/mailmanager/updater/inbox/request.json
 Unit=mailmanager-updater.service
 
 [Install]

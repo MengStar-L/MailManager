@@ -2,7 +2,7 @@
 set -eu
 
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
-VERSION=${VERSION:-1.0.0}
+VERSION=${VERSION:-1.1.0}
 VERSION=${VERSION#v}
 case "$VERSION" in
     ''|*[!0-9.]*) VALID_VERSION=0 ;;
@@ -40,6 +40,7 @@ cp "$ROOT/deploy/mailmanager.service" "$DIST/mailmanager.service"
 cp "$ROOT/deploy/mailmanager-updater.service" "$DIST/mailmanager-updater.service"
 cp "$ROOT/deploy/mailmanager-updater.path" "$DIST/mailmanager-updater.path"
 cp "$ROOT/deploy/mailmanager.env.example" "$DIST/mailmanager.env.example"
+cp "$ROOT/deploy/nginx.conf.example" "$DIST/nginx.conf.example"
 cp "$ROOT/scripts/install-linux.sh" "$DIST/install-linux.sh"
 
 cd "$DIST"
@@ -50,7 +51,8 @@ set -- \
     mailmanager-linux-arm64 \
     mailmanager-updater.path \
     mailmanager-updater.service \
-    mailmanager.service
+    mailmanager.service \
+    nginx.conf.example
 if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$@" | LC_ALL=C sort -k2 > checksums.txt
 elif command -v shasum >/dev/null 2>&1; then
