@@ -129,7 +129,9 @@ validate_public_url() {
     set -- $host
     IFS=$old_ifs
     for label in "$@"; do
-        [ -n "$label" ] && [ "${#label}" -le 63 ] || die "--public-url contains an invalid domain label"
+        if [ -z "$label" ] || [ "${#label}" -gt 63 ]; then
+            die "--public-url contains an invalid domain label"
+        fi
         case "$label" in
             -*|*-|*[!A-Za-z0-9-]*) die "--public-url contains an invalid domain label" ;;
         esac
@@ -140,7 +142,9 @@ validate_public_url() {
             case "$port" in
                 ''|*[!0-9]*) die "--public-url contains an invalid port" ;;
             esac
-            [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "--public-url port must be between 1 and 65535"
+            if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+                die "--public-url port must be between 1 and 65535"
+            fi
             ;;
     esac
 }
