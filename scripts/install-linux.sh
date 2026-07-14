@@ -34,7 +34,7 @@ die() {
 }
 
 has_tty() {
-    [ -r /dev/tty ] && [ -w /dev/tty ]
+    [ -t 0 ] && [ -r /dev/tty ] && [ -w /dev/tty ]
 }
 
 prompt() {
