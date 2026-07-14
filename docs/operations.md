@@ -21,9 +21,12 @@ sudo cat /opt/mailmanager/updater/status.json
 本机健康检查：
 
 ```bash
+sudo grep '^MAILMANAGER_ADDR=' /opt/mailmanager/config/mailmanager.env
 curl --fail http://127.0.0.1:8080/healthz
 curl --fail http://127.0.0.1:8080/readyz
 ```
+
+上面的请求使用默认端口。如果安装时选择了其他本机端口，请按 `MAILMANAGER_ADDR` 的值替换 `8080`。
 
 ## 更新
 
@@ -40,8 +43,11 @@ curl --fail http://127.0.0.1:8080/readyz
 ```bash
 sudo sh /tmp/install-mailmanager.sh \
   --install-dir /opt/mailmanager \
+  --port 8080 \
   --public-url https://mail.example.com
 ```
+
+如果首次安装使用了自定义本机端口，手动升级时应传入相同的 `--port` 值。
 
 将 `/opt/mailmanager/config/mailmanager.env` 中的 `MAILMANAGER_AUTO_UPDATE_ENABLED` 改为 `false` 可以关闭网页安装能力；版本信息和手动检查仍会显示。
 
@@ -81,6 +87,8 @@ sudo chmod 0700 /opt/mailmanager/data
 sudo systemctl start mailmanager.service
 curl --fail http://127.0.0.1:8080/readyz
 ```
+
+自定义端口部署请按恢复后的 `config/mailmanager.env` 中 `MAILMANAGER_ADDR` 的值执行健康检查。
 
 SQLite 迁移只向前执行。如果新版本已经执行不兼容迁移，二进制自动回滚后仍可能需要恢复数据库备份。
 

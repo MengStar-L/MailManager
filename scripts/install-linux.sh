@@ -3,8 +3,10 @@ set -eu
 
 REPOSITORY="MengStar-L/MailManager"
 DEFAULT_INSTALL_DIR="/opt/mailmanager"
+DEFAULT_PORT=8080
 VERSION=${MAILMANAGER_VERSION:-latest}
 INSTALL_DIR=${MAILMANAGER_INSTALL_DIR:-}
+PORT=${MAILMANAGER_PORT:-}
 PUBLIC_URL=${MAILMANAGER_PUBLIC_URL:-}
 START_SERVICE=1
 ASSUME_YES=0
@@ -19,6 +21,7 @@ Installs or upgrades MailManager from the official GitHub Release assets.
 
 Options:
   --install-dir PATH   Installation root (default: /opt/mailmanager)
+  --port PORT          Local MailManager listening port (default: 8080)
   --public-url URL     Public HTTPS origin, for example https://mail.example.com
   --version VERSION    Stable version tag or latest (default: latest)
   --no-start           Install without starting or health-checking the service
@@ -102,6 +105,17 @@ validate_install_dir() {
     esac
 }
 
+validate_port() {
+    value=$1
+    case "$value" in
+        ''|*[!0-9]*) die "--port must be a decimal number between 1 and 65535" ;;
+        ??????*) die "--port must be between 1 and 65535" ;;
+    esac
+    if [ "$value" -lt 1 ] || [ "$value" -gt 65535 ]; then
+        die "--port must be between 1 and 65535"
+    fi
+}
+
 validate_public_url() {
     value=$1
     case "$value" in
@@ -156,6 +170,11 @@ while [ "$#" -gt 0 ]; do
             INSTALL_DIR=$2
             shift 2
             ;;
+        --port)
+            [ "$#" -ge 2 ] || die "--port requires a value"
+            PORT=$2
+            shift 2
+            ;;
         --public-url)
             [ "$#" -ge 2 ] || die "--public-url requires a value"
             PUBLIC_URL=$2
@@ -200,6 +219,15 @@ while [ "$INSTALL_DIR" != "/" ] && [ "${INSTALL_DIR%/}" != "$INSTALL_DIR" ]; do
 done
 validate_install_dir "$INSTALL_DIR"
 
+if [ -z "$PORT" ]; then
+    if has_tty; then
+        PORT=$(prompt "本机监听端口" "$DEFAULT_PORT")
+    else
+        PORT=$DEFAULT_PORT
+    fi
+fi
+validate_port "$PORT"
+
 if [ -z "$PUBLIC_URL" ]; then
     if has_tty; then
         PUBLIC_URL=$(prompt "公开 HTTPS 地址" "")
@@ -230,7 +258,8 @@ MASTER_KEY_FILE="$CONFIG_DIR/master.key"
 DATA_DIR="$INSTALL_DIR/data"
 UPDATER_ROOT="$INSTALL_DIR/updater"
 INSTALLED_VERSION_FILE="$UPDATER_ROOT/installed-version"
-READY_URL="http://127.0.0.1:8080/readyz"
+LISTEN_ADDR="127.0.0.1:$PORT"
+READY_URL="http://$LISTEN_ADDR/readyz"
 
 show_summary() {
     if [ "$START_SERVICE" -eq 1 ]; then
@@ -242,7 +271,7 @@ show_summary() {
     printf '  版本:       %s\n' "$VERSION"
     printf '  安装目录:   %s\n' "$INSTALL_DIR"
     printf '  公开地址:   %s\n' "$PUBLIC_URL"
-    printf '  本机监听:   127.0.0.1:8080\n'
+    printf '  本机监听:   %s\n' "$LISTEN_ADDR"
     printf '  配置文件:   %s\n' "$ENV_FILE"
     printf '  数据目录:   %s\n' "$DATA_DIR"
     printf '  更新目录:   %s\n' "$UPDATER_ROOT"
@@ -390,7 +419,7 @@ ensure_environment() {
     fi
 }
 
-set_environment MAILMANAGER_ADDR 127.0.0.1:8080
+set_environment MAILMANAGER_ADDR "$LISTEN_ADDR"
 set_environment MAILMANAGER_PUBLIC_URL "$PUBLIC_URL"
 set_environment MAILMANAGER_DATA_DIR "$DATA_DIR"
 set_environment MAILMANAGER_DATABASE_PATH "$DATA_DIR/mailmanager.db"
@@ -421,6 +450,7 @@ sed \
     -e "s|mail.example.com|$PUBLIC_HOST|g" \
     -e "s|listen 443 ssl|listen $PUBLIC_PORT ssl|g" \
     -e "s|listen \[::\]:443 ssl|listen [::]:$PUBLIC_PORT ssl|g" \
+    -e "s|127.0.0.1:8080|$LISTEN_ADDR|g" \
     "$TMP_DIR/nginx.conf.example" > "$TMP_DIR/nginx.conf"
 install -m 0640 -o root -g mailmanager "$TMP_DIR/nginx.conf" "$CONFIG_DIR/nginx.conf.example"
 

@@ -11,7 +11,7 @@
 - Nginx 或其他 HTTPS 反向代理。
 - root 或 sudo 权限。
 
-MailManager 只监听 `127.0.0.1:8080`。请勿把该端口直接暴露到公网。
+MailManager 只监听 `127.0.0.1`。本机端口可在安装时选择，默认是 `8080`；请勿把该端口直接暴露到公网。
 
 ## 交互式安装
 
@@ -22,7 +22,9 @@ curl --proto '=https' --tlsv1.2 -fsSL \
 sudo sh /tmp/install-mailmanager.sh
 ```
 
-向导会询问安装根目录和公开 HTTPS 地址，并在写入系统前显示摘要。直接回车会把文件安装到 `/opt/mailmanager`。
+向导会依次询问安装根目录、MailManager 本机监听端口和公开 HTTPS 地址，并在写入系统前显示摘要。安装目录直接回车使用 `/opt/mailmanager`，本机端口直接回车使用 `8080`。
+
+该端口只控制 MailManager 在 `127.0.0.1` 上的监听地址，以及 Nginx 示例中的上游地址。公网 HTTPS 端口由你在 Nginx 中自行配置。
 
 可以先预览结果，不下载或修改任何文件：
 
@@ -30,6 +32,7 @@ sudo sh /tmp/install-mailmanager.sh
 sh /tmp/install-mailmanager.sh \
   --dry-run \
   --install-dir /opt/mailmanager \
+  --port 9090 \
   --public-url https://mail.example.com
 ```
 
@@ -40,6 +43,7 @@ sh /tmp/install-mailmanager.sh \
 ```bash
 sudo sh /tmp/install-mailmanager.sh \
   --install-dir /opt/mailmanager \
+  --port 9090 \
   --public-url https://mail.example.com \
   --yes
 ```
@@ -76,7 +80,7 @@ sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-示例为普通 Nginx TLS 反向代理，并为实时同步事件关闭代理缓冲；如果公开地址使用非标准 HTTPS 端口，安装器也会同步渲染监听端口。使用 Caddy、Traefik 或其他代理时，也必须保留长连接并把请求转发到 `127.0.0.1:8080`。
+示例为普通 Nginx TLS 反向代理，并为实时同步事件关闭代理缓冲。安装器会把 `proxy_pass` 渲染为所选的 MailManager 本机端口；公网 `listen` 端口属于 Nginx 配置，请根据实际环境自行确认。使用 Caddy、Traefik 或其他代理时，也必须保留长连接并把请求转发到所选的 `127.0.0.1` 端口。
 
 如果通过 Certbot 申请证书，请先完成域名解析，再按所在发行版的 Certbot 文档签发证书。证书中的域名必须与 `MAILMANAGER_PUBLIC_URL` 一致。
 
@@ -123,6 +127,7 @@ https://mail.example.com
 
 ```text
 --install-dir PATH
+--port PORT
 --public-url https://mail.example.com
 --version vX.Y.Z|latest
 --no-start
@@ -136,3 +141,5 @@ https://mail.example.com
 sudo systemctl status mailmanager.service mailmanager-updater.path
 curl --fail http://127.0.0.1:8080/readyz
 ```
+
+上例使用默认端口。自定义端口安装后，请将 `8080` 替换为 `/opt/mailmanager/config/mailmanager.env` 中 `MAILMANAGER_ADDR` 的端口。

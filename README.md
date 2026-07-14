@@ -68,7 +68,7 @@ MailManager 是一个适合长期运行在私人 Linux 服务器上的多邮箱 
 
 - 一台使用 systemd 的 Linux 服务器，架构为 amd64 或 arm64。
 - 一个已解析到服务器的域名，以及该域名的有效 HTTPS 证书。
-- Nginx 或其他可以把 HTTPS 反向代理到 `127.0.0.1:8080` 的 Web 服务器。
+- Nginx 或其他可以把 HTTPS 反向代理到 MailManager 本机监听端口的 Web 服务器。
 - root 或 sudo 权限。
 
 执行下面的命令：
@@ -80,10 +80,13 @@ curl --proto '=https' --tlsv1.2 -fsSL \
 sudo sh /tmp/install-mailmanager.sh
 ```
 
-安装向导只会询问两项内容：
+安装向导会询问三项内容：
 
 1. 安装目录，直接回车使用 `/opt/mailmanager`。
-2. 完整 HTTPS 地址，例如 `https://mail.example.com`。
+2. MailManager 本机监听端口，直接回车使用 `8080`。
+3. 完整 HTTPS 地址，例如 `https://mail.example.com`。
+
+本机端口只用于 `127.0.0.1` 上的 MailManager 服务。公网 HTTPS 监听端口由你在 Nginx 中自行配置，不会与本机端口联动。无人值守安装可使用 `--port 9090` 指定本机端口。
 
 确认后，脚本会自动识别服务器架构、下载稳定版、校验 SHA-256、生成主密钥、注册 systemd 服务并启动 MailManager。
 
@@ -143,13 +146,13 @@ MailManager 每 6 小时检查一次最新稳定 GitHub Release，不跟随 `mai
 <details>
 <summary><strong>为什么必须填写 HTTPS 地址？</strong></summary>
 
-MailManager 使用固定公开地址进行 Cookie 安全判断、写请求同源校验和 OAuth 回调。生产环境必须使用真实 HTTPS 域名，不能直接暴露本机的 `8080` 端口。
+MailManager 使用固定公开地址进行 Cookie 安全判断、写请求同源校验和 OAuth 回调。生产环境必须使用真实 HTTPS 域名，不能直接暴露 MailManager 的本机监听端口。
 </details>
 
 <details>
 <summary><strong>安装后网页打不开怎么办？</strong></summary>
 
-先运行 `sudo systemctl status mailmanager.service` 和 `curl http://127.0.0.1:8080/readyz`。如果本机服务正常，问题通常位于域名解析、证书或 Nginx 配置。详细检查命令见 [`docs/operations.md`](./docs/operations.md)。
+先运行 `sudo systemctl status mailmanager.service`，再根据 `/opt/mailmanager/config/mailmanager.env` 中的 `MAILMANAGER_ADDR` 请求 `/readyz`。如果本机服务正常，问题通常位于域名解析、证书或 Nginx 配置。详细检查命令见 [`docs/operations.md`](./docs/operations.md)。
 </details>
 
 <details>

@@ -137,13 +137,14 @@ jobs:
           sudo sh /tmp/install-mailmanager-smoke.sh \
             --version "$GITHUB_REF_NAME" \
             --install-dir "$install_root" \
+            --port 18081 \
             --public-url https://mail.example.com \
             --yes
 
           set -x
           systemctl is-active --quiet mailmanager.service
           systemctl is-active --quiet mailmanager-updater.path
-          curl --fail --silent http://127.0.0.1:8080/readyz >/dev/null
+          curl --fail --silent http://127.0.0.1:18081/readyz >/dev/null
           sudo test -s "$install_root/data/bootstrap-token"
           test "$(sudo stat -c '%U:%G %a' "$install_root/config")" = 'root:mailmanager 750'
           test "$(sudo stat -c '%U:%G %a' "$install_root/config/mailmanager.env")" = 'root:mailmanager 640'
@@ -151,7 +152,11 @@ jobs:
           test "$(sudo stat -c '%U:%G %a' "$install_root/data")" = 'mailmanager:mailmanager 700'
           test "$(sudo stat -c '%U:%G %a' "$install_root/updater")" = 'root:mailmanager 2750'
           grep -F "ExecStart=$install_root/bin/mailmanager serve" /etc/systemd/system/mailmanager.service
+          sudo grep -F 'MAILMANAGER_ADDR=127.0.0.1:18081' "$install_root/config/mailmanager.env"
+          sudo grep -F 'MAILMANAGER_UPDATE_READY_URL=http://127.0.0.1:18081/readyz' "$install_root/config/mailmanager.env"
           sudo grep -F 'server_name mail.example.com;' "$install_root/config/nginx.conf.example"
+          test "$(sudo grep -Fc 'proxy_pass http://127.0.0.1:18081;' "$install_root/config/nginx.conf.example")" = 2
+          sudo grep -F 'listen 443 ssl http2;' "$install_root/config/nginx.conf.example"
 
       - name: Pack release artifact
         run: tar -C dist -czf release-assets.tar.gz .
