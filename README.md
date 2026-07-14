@@ -86,7 +86,7 @@ sudo sh /tmp/install-mailmanager.sh
 2. MailManager 本机监听端口，直接回车使用 `8080`。
 3. 完整 HTTPS 地址，例如 `https://mail.example.com`。
 
-本机端口只用于 `127.0.0.1` 上的 MailManager 服务。公网 HTTPS 监听端口由你在 Nginx 中自行配置，不会与本机端口联动。无人值守安装可使用 `--port 9090` 指定本机端口。
+MailManager 默认在 `0.0.0.0` 上监听该本机端口，即接受所有本机 IPv4 网卡的连接；请通过主机防火墙避免将它直接暴露到公网。公网 HTTPS 监听端口由你在 Nginx 中自行配置，不会与本机端口联动。无人值守安装可使用 `--port 9090` 指定本机端口。
 
 确认后，脚本会自动识别服务器架构、下载稳定版、校验 SHA-256、生成主密钥、注册 systemd 服务并启动 MailManager。
 

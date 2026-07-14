@@ -15,7 +15,7 @@ func TestLoadDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Address != defaultAddress || cfg.SessionTTL != defaultSessionTTL {
+	if cfg.Address != "0.0.0.0:8080" || cfg.SessionTTL != defaultSessionTTL {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
 	if cfg.SecureCookies {
@@ -29,6 +29,23 @@ func TestLoadDefaults(t *testing.T) {
 	expectedInstalled, _ := filepath.Abs(filepath.FromSlash("/opt/mailmanager/updater/installed-version"))
 	if cfg.UpdateInboxDir != expectedInbox || cfg.UpdateStatePath != expectedState || cfg.UpdateInstalledVersionPath != expectedInstalled {
 		t.Fatalf("unexpected updater defaults: %+v", cfg)
+	}
+}
+
+func TestLoadHonorsExplicitAddress(t *testing.T) {
+	for _, address := range []string{"127.0.0.1:9090", "192.0.2.10:9090"} {
+		t.Run(address, func(t *testing.T) {
+			t.Setenv("MAILMANAGER_DATA_DIR", t.TempDir())
+			t.Setenv("MAILMANAGER_ADDR", address)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Address != address {
+				t.Fatalf("address = %q, want %q", cfg.Address, address)
+			}
+		})
 	}
 }
 

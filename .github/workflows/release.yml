@@ -152,7 +152,7 @@ jobs:
           test "$(sudo stat -c '%U:%G %a' "$install_root/data")" = 'mailmanager:mailmanager 700'
           test "$(sudo stat -c '%U:%G %a' "$install_root/updater")" = 'root:mailmanager 2750'
           grep -F "ExecStart=$install_root/bin/mailmanager serve" /etc/systemd/system/mailmanager.service
-          sudo grep -F 'MAILMANAGER_ADDR=127.0.0.1:18081' "$install_root/config/mailmanager.env"
+          sudo grep -F 'MAILMANAGER_ADDR=0.0.0.0:18081' "$install_root/config/mailmanager.env"
           sudo grep -F 'MAILMANAGER_UPDATE_READY_URL=http://127.0.0.1:18081/readyz' "$install_root/config/mailmanager.env"
           sudo grep -F 'server_name mail.example.com;' "$install_root/config/nginx.conf.example"
           test "$(sudo grep -Fc 'proxy_pass http://127.0.0.1:18081;' "$install_root/config/nginx.conf.example")" = 2

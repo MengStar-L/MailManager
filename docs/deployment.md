@@ -11,7 +11,7 @@
 - Nginx 或其他 HTTPS 反向代理。
 - root 或 sudo 权限。
 
-MailManager 只监听 `127.0.0.1`。本机端口可在安装时选择，默认是 `8080`；请勿把该端口直接暴露到公网。
+MailManager 默认监听所有本机 IPv4 网卡（`0.0.0.0`）。本机端口可在安装时选择，默认是 `8080`；请通过主机防火墙避免把该端口直接暴露到公网。
 
 ## 交互式安装
 
@@ -24,7 +24,7 @@ sudo sh /tmp/install-mailmanager.sh
 
 向导会依次询问安装根目录、MailManager 本机监听端口和公开 HTTPS 地址，并在写入系统前显示摘要。安装目录直接回车使用 `/opt/mailmanager`，本机端口直接回车使用 `8080`。
 
-该端口只控制 MailManager 在 `127.0.0.1` 上的监听地址，以及 Nginx 示例中的上游地址。公网 HTTPS 端口由你在 Nginx 中自行配置。
+该端口控制 MailManager 的监听端口。公网 HTTPS 端口由你在 Nginx 中自行配置，不会与该端口联动。
 
 可以先预览结果，不下载或修改任何文件：
 

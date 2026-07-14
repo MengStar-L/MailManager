@@ -258,8 +258,9 @@ MASTER_KEY_FILE="$CONFIG_DIR/master.key"
 DATA_DIR="$INSTALL_DIR/data"
 UPDATER_ROOT="$INSTALL_DIR/updater"
 INSTALLED_VERSION_FILE="$UPDATER_ROOT/installed-version"
-LISTEN_ADDR="127.0.0.1:$PORT"
-READY_URL="http://$LISTEN_ADDR/readyz"
+LISTEN_ADDR="0.0.0.0:$PORT"
+LOOPBACK_ADDR="127.0.0.1:$PORT"
+READY_URL="http://$LOOPBACK_ADDR/readyz"
 
 show_summary() {
     if [ "$START_SERVICE" -eq 1 ]; then
@@ -450,7 +451,7 @@ sed \
     -e "s|mail.example.com|$PUBLIC_HOST|g" \
     -e "s|listen 443 ssl|listen $PUBLIC_PORT ssl|g" \
     -e "s|listen \[::\]:443 ssl|listen [::]:$PUBLIC_PORT ssl|g" \
-    -e "s|127.0.0.1:8080|$LISTEN_ADDR|g" \
+    -e "s|127.0.0.1:8080|$LOOPBACK_ADDR|g" \
     "$TMP_DIR/nginx.conf.example" > "$TMP_DIR/nginx.conf"
 install -m 0640 -o root -g mailmanager "$TMP_DIR/nginx.conf" "$CONFIG_DIR/nginx.conf.example"
 

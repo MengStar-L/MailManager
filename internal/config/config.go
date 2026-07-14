@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	defaultAddress         = "127.0.0.1:8080"
+	defaultAddress         = "0.0.0.0:8080"
 	defaultPublicURL       = "http://localhost:8080"
 	defaultSessionTTL      = 30 * 24 * time.Hour
 	defaultSetupTTL        = 30 * time.Minute
