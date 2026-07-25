@@ -122,6 +122,7 @@ type fakeIMAPSession struct {
 	copyCalls    int
 	deleteCalls  int
 	flagCalls    int
+	idleFunc     func(context.Context) (connectors.IMAPEvent, error)
 }
 
 func (s *fakeIMAPSession) Capabilities(context.Context) (connectors.IMAPCapabilities, error) {
@@ -176,6 +177,9 @@ func (s *fakeIMAPSession) FetchPart(context.Context, uint32, []int, int64) ([]by
 }
 
 func (s *fakeIMAPSession) Idle(ctx context.Context) (connectors.IMAPEvent, error) {
+	if s.idleFunc != nil {
+		return s.idleFunc(ctx)
+	}
 	<-ctx.Done()
 	return connectors.IMAPEvent{}, ctx.Err()
 }
@@ -262,7 +266,7 @@ func newRuntimeFixture(t *testing.T) runtimeFixture {
 	dialer := &fakeIMAPDialer{session: session}
 	sender := &fakeMailSender{result: connectors.DeliveryResult{Status: connectors.DeliveryFailed, Stage: connectors.StageConnect}, err: errors.New("not configured")}
 	oauth := &fakeOAuthRefresher{}
-	repo := repository.New(database.DB())
+	repo := repository.New(database)
 	runtime, err := New(Options{
 		Store: database, Repository: repo, IngestStore: ingeststore.New(database), Cipher: cipher,
 		OAuth: oauth, Events: events.NewHub(32), IMAPDialer: dialer, SMTPSender: sender,
@@ -402,6 +406,156 @@ func TestSyncQueueDeduplicatesAndWorkersStayWithinLimit(t *testing.T) {
 	}
 	close(gate)
 	cancel()
+}
+
+func TestSyncQueuePreservesReconciliationRequest(t *testing.T) {
+	fixture := newRuntimeFixture(t)
+	full := syncJob{accountID: "account", folderID: "folder", mailbox: "INBOX", kind: syncFolder, reconcile: true}
+	fast := syncJob{accountID: "account", folderID: "folder", mailbox: "INBOX", kind: syncFolder}
+	if err := fixture.runtime.enqueueSync(context.Background(), full); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.runtime.enqueueSync(context.Background(), fast); err != nil {
+		t.Fatal(err)
+	}
+	if !fixture.runtime.pending[full.key()].job.reconcile {
+		t.Fatal("fast rerun downgraded a pending full reconciliation")
+	}
+}
+
+func TestFolderReconciliationSchedulesInboxAndOtherFolders(t *testing.T) {
+	fixture := newRuntimeFixture(t)
+	account, _ := fixture.createPasswordAccount(t)
+	folders, err := fixture.runtime.ingest.UpsertFolders(context.Background(), account.ID, []connectors.RemoteMailbox{
+		{Name: "INBOX", Selectable: true, Role: accounts.FolderInbox},
+		{Name: "Archive", Selectable: true, Role: accounts.FolderArchive},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fixture.runtime.scheduleFolderReconciliation(context.Background())
+	queued := make(map[string]syncJob)
+	for len(fixture.runtime.syncHigh) > 0 {
+		job := <-fixture.runtime.syncHigh
+		queued[job.folderID] = job
+	}
+	if len(queued) != len(folders) {
+		t.Fatalf("reconciliation queued %d folders, want %d", len(queued), len(folders))
+	}
+	for _, folder := range folders {
+		if !queued[folder.ID].reconcile {
+			t.Fatalf("folder %q was not queued for full reconciliation", folder.RemoteName)
+		}
+	}
+}
+
+func TestInboxPollingRunsWhileIdleWatcherIsActive(t *testing.T) {
+	fixture := newRuntimeFixture(t)
+	account, _ := fixture.createPasswordAccount(t)
+	folders, err := fixture.runtime.ingest.UpsertFolders(context.Background(), account.ID, []connectors.RemoteMailbox{
+		{Name: "INBOX", Selectable: true, Role: accounts.FolderInbox},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.runtime.idleMu.Lock()
+	fixture.runtime.idleWatchers[account.ID] = idleWatcher{folderID: folders[0].ID, mailbox: "INBOX", token: 1}
+	fixture.runtime.idleMu.Unlock()
+
+	fixture.runtime.scheduleInboxPolling(context.Background())
+	select {
+	case job := <-fixture.runtime.syncHigh:
+		if job.accountID != account.ID || job.folderID != folders[0].ID || job.mailbox != "INBOX" || job.reconcile {
+			t.Fatalf("unexpected Inbox poll job: %#v", job)
+		}
+	default:
+		t.Fatal("active IDLE watcher suppressed the Inbox fallback poll")
+	}
+}
+
+func TestIdleLoopImmediatelyRestartsAfterPlannedTimeout(t *testing.T) {
+	fixture := newRuntimeFixture(t)
+	account, _ := fixture.createPasswordAccount(t)
+	folders, err := fixture.runtime.ingest.UpsertFolders(context.Background(), account.ID, []connectors.RemoteMailbox{
+		{Name: "INBOX", Selectable: true, Role: accounts.FolderInbox},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.session.capabilities = connectors.IMAPCapabilities{Idle: true}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	idleCalls := 0
+	fixture.session.idleFunc = func(context.Context) (connectors.IMAPEvent, error) {
+		idleCalls++
+		if idleCalls == 1 {
+			return connectors.IMAPEvent{}, context.DeadlineExceeded
+		}
+		cancel()
+		return connectors.IMAPEvent{}, context.Canceled
+	}
+
+	done := make(chan struct{})
+	go func() {
+		fixture.runtime.idleLoop(ctx, account.ID, folders[0].ID, "INBOX", 1)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		cancel()
+		<-done
+	}
+	if idleCalls != 2 {
+		t.Fatalf("IDLE calls after planned timeout = %d, want 2 without retry delay", idleCalls)
+	}
+	fixture.dialer.mu.Lock()
+	dialCalls := fixture.dialer.calls
+	fixture.dialer.mu.Unlock()
+	if dialCalls != 1 {
+		t.Fatalf("IMAP dials across planned IDLE timeout = %d, want 1", dialCalls)
+	}
+}
+
+func TestSyncJobsForSameAccountAreSerialized(t *testing.T) {
+	fixture := newRuntimeFixture(t)
+	account, _ := fixture.createPasswordAccount(t)
+	folders, err := fixture.runtime.ingest.UpsertFolders(context.Background(), account.ID, []connectors.RemoteMailbox{
+		{Name: "INBOX", Selectable: true, Role: accounts.FolderInbox},
+		{Name: "Archive", Selectable: true, Role: accounts.FolderArchive},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gate := make(chan struct{})
+	dialer := &blockingIMAPDialer{gate: gate, started: make(chan struct{}, 4)}
+	fixture.runtime.imapDialer = dialer
+	done := make(chan error, len(folders))
+	for _, folder := range folders {
+		job := syncJob{accountID: account.ID, folderID: folder.ID, mailbox: folder.RemoteName, kind: syncFolder}
+		go func() { done <- fixture.runtime.runSyncJob(context.Background(), job) }()
+	}
+	select {
+	case <-dialer.started:
+	case <-time.After(time.Second):
+		t.Fatal("first same-account sync did not start")
+	}
+	time.Sleep(50 * time.Millisecond)
+	dialer.mu.Lock()
+	peak := dialer.peak
+	dialer.mu.Unlock()
+	if peak != 1 {
+		close(gate)
+		t.Fatalf("same-account peak connections = %d, want 1", peak)
+	}
+	close(gate)
+	for range folders {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func TestSyncWorkersDoNotDeadlockWhenDiscoveryAndBackfillExceedQueueCapacity(t *testing.T) {

@@ -4,9 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
-	"sync"
 	"time"
+
+	"mailmanager/internal/store"
 )
 
 var (
@@ -16,30 +16,16 @@ var (
 )
 
 type Repository struct {
-	db      *sql.DB
-	writeMu sync.Mutex
+	store *store.Store
+	db    *sql.DB
 }
 
-func New(db *sql.DB) *Repository {
-	return &Repository{db: db}
+func New(database *store.Store) *Repository {
+	return &Repository{store: database, db: database.DB()}
 }
 
 func (r *Repository) writeTx(ctx context.Context, fn func(*sql.Tx) error) error {
-	r.writeMu.Lock()
-	defer r.writeMu.Unlock()
-
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin repository write: %w", err)
-	}
-	if err := fn(tx); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit repository write: %w", err)
-	}
-	return nil
+	return r.store.WriteTx(ctx, fn)
 }
 
 func nowUTC() time.Time {

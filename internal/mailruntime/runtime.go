@@ -91,10 +91,10 @@ type Runtime struct {
 
 	idleMu       sync.Mutex
 	idleWatchers map[string]idleWatcher
-	idleActive   map[string]bool
 	idleSequence uint64
 
-	accountLocks sync.Map
+	accountLocks       sync.Map
+	syncExecutionLocks sync.Map
 
 	pollInterval      time.Duration
 	reconcileInterval time.Duration
@@ -106,6 +106,7 @@ type syncJob struct {
 	folderID  string
 	mailbox   string
 	kind      syncJobKind
+	reconcile bool
 }
 
 type syncJobKind uint8
@@ -170,7 +171,7 @@ func New(options Options) (*Runtime, error) {
 		syncHigh:           make(chan syncJob, 256), syncLow: make(chan syncJob, 256),
 		pending: make(map[string]*syncJobState), failures: make(map[string]int),
 		operationWake: make(chan struct{}, 1), outboxWake: make(chan struct{}, 1),
-		idleWatchers: make(map[string]idleWatcher), idleActive: make(map[string]bool),
+		idleWatchers: make(map[string]idleWatcher),
 		pollInterval: mailSync.InboxPollInterval, reconcileInterval: mailSync.FolderReconcileInterval,
 		queuePollInterval: defaultQueuePoll,
 	}, nil
@@ -270,6 +271,11 @@ func (r *Runtime) runtimeContext() (context.Context, error) {
 
 func (r *Runtime) accountLock(accountID string) *sync.Mutex {
 	value, _ := r.accountLocks.LoadOrStore(accountID, &sync.Mutex{})
+	return value.(*sync.Mutex)
+}
+
+func (r *Runtime) syncExecutionLock(accountID string) *sync.Mutex {
+	value, _ := r.syncExecutionLocks.LoadOrStore(accountID, &sync.Mutex{})
 	return value.(*sync.Mutex)
 }
 

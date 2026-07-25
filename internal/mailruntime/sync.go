@@ -31,6 +31,7 @@ func (r *Runtime) enqueueSync(ctx context.Context, job syncJob) error {
 	key := job.key()
 	r.syncMu.Lock()
 	if current, ok := r.pending[key]; ok {
+		job.reconcile = job.reconcile || current.job.reconcile
 		current.job = job
 		current.rerun = true
 		r.syncMu.Unlock()
@@ -157,6 +158,10 @@ func (r *Runtime) finishSyncJob(ctx context.Context, job syncJob, runErr error) 
 }
 
 func (r *Runtime) runSyncJob(ctx context.Context, job syncJob) error {
+	lock := r.syncExecutionLock(job.accountID)
+	lock.Lock()
+	defer lock.Unlock()
+
 	var err error
 	switch job.kind {
 	case syncDiscover:
@@ -252,10 +257,15 @@ func (r *Runtime) syncFolder(ctx context.Context, job syncJob) error {
 	if err != nil {
 		return err
 	}
-	_, err = r.synchronizer.Sync(ctx, session, r.ingest, mailSync.FolderSyncRequest{
+	request := mailSync.FolderSyncRequest{
 		AccountID: job.accountID, FolderID: job.folderID, Mailbox: job.mailbox, Provider: config.Provider,
 		Checkpoint: checkpoint, PendingOperationIDs: pending, Now: time.Now().UTC(),
-	})
+	}
+	if job.reconcile {
+		_, err = r.synchronizer.Sync(ctx, session, r.ingest, request)
+	} else {
+		_, err = r.synchronizer.SyncIncremental(ctx, session, r.ingest, request)
+	}
 	if err != nil {
 		_ = r.ingest.MarkFolderError(ctx, job.accountID, job.folderID, "sync_failed")
 		return err
@@ -321,7 +331,7 @@ func (r *Runtime) syncScheduler(ctx context.Context) {
 		case <-poll.C:
 			r.scheduleInboxPolling(ctx)
 		case <-reconcile.C:
-			r.scheduleNonInbox(ctx)
+			r.scheduleFolderReconciliation(ctx)
 		}
 	}
 }
@@ -356,9 +366,6 @@ func (r *Runtime) scheduleInboxPolling(ctx context.Context) {
 			_ = r.enqueueSync(ctx, syncJob{accountID: account.ID, kind: syncDiscover})
 			continue
 		}
-		if r.idleIsActive(account.ID) {
-			continue
-		}
 		for _, folder := range folders {
 			if folder.Role == "inbox" {
 				_ = r.enqueueSync(ctx, syncJob{accountID: account.ID, folderID: folder.ID, mailbox: folder.RemoteName, kind: syncFolder})
@@ -369,7 +376,7 @@ func (r *Runtime) scheduleInboxPolling(ctx context.Context) {
 	r.removeIdleWatchersNotIn(present)
 }
 
-func (r *Runtime) scheduleNonInbox(ctx context.Context) {
+func (r *Runtime) scheduleFolderReconciliation(ctx context.Context) {
 	accounts, err := r.repository.ListAccounts(ctx)
 	if err != nil {
 		r.logger.Warn("list accounts for folder reconciliation", "error", err)
@@ -384,9 +391,10 @@ func (r *Runtime) scheduleNonInbox(ctx context.Context) {
 			continue
 		}
 		for _, folder := range folders {
-			if folder.Role != "inbox" {
-				_ = r.enqueueSync(ctx, syncJob{accountID: account.ID, folderID: folder.ID, mailbox: folder.RemoteName, kind: syncFolder})
-			}
+			_ = r.enqueueSync(ctx, syncJob{
+				accountID: account.ID, folderID: folder.ID, mailbox: folder.RemoteName,
+				kind: syncFolder, reconcile: true,
+			})
 		}
 	}
 }
@@ -404,7 +412,6 @@ func (r *Runtime) ensureIdleWatcher(accountID, folderID, mailbox string) {
 	r.idleSequence++
 	token := r.idleSequence
 	r.idleWatchers[accountID] = idleWatcher{folderID: folderID, mailbox: mailbox, cancel: cancel, token: token}
-	r.idleActive[accountID] = false
 	r.idleMu.Unlock()
 	if !r.goDynamic(func(ctx context.Context) { r.idleLoop(ctx, accountID, folderID, mailbox, token) }, ctx) {
 		cancel()
@@ -442,18 +449,19 @@ func (r *Runtime) idleLoop(ctx context.Context, accountID, folderID, mailbox str
 			r.waitIdleRetry(ctx, &failures)
 			continue
 		}
-		r.setIdleActive(accountID, token, true)
 		failures = 0
 		for ctx.Err() == nil {
 			idleCtx, cancel := context.WithTimeout(ctx, 25*time.Minute)
 			_, err := session.Idle(idleCtx)
 			cancel()
+			if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+				continue
+			}
 			if err != nil {
 				break
 			}
 			_ = r.enqueueSync(ctx, syncJob{accountID: accountID, folderID: folderID, mailbox: mailbox, kind: syncFolder})
 		}
-		r.setIdleActive(accountID, token, false)
 		_ = session.Close()
 		if ctx.Err() == nil {
 			r.waitIdleRetry(ctx, &failures)
@@ -471,27 +479,12 @@ func (r *Runtime) waitIdleRetry(ctx context.Context, failures *int) {
 	}
 }
 
-func (r *Runtime) setIdleActive(accountID string, token uint64, active bool) {
-	r.idleMu.Lock()
-	defer r.idleMu.Unlock()
-	if watcher, ok := r.idleWatchers[accountID]; ok && watcher.token == token {
-		r.idleActive[accountID] = active
-	}
-}
-
 func (r *Runtime) finishIdleWatcher(accountID string, token uint64) {
 	r.idleMu.Lock()
 	defer r.idleMu.Unlock()
 	if watcher, ok := r.idleWatchers[accountID]; ok && watcher.token == token {
 		delete(r.idleWatchers, accountID)
-		delete(r.idleActive, accountID)
 	}
-}
-
-func (r *Runtime) idleIsActive(accountID string) bool {
-	r.idleMu.Lock()
-	defer r.idleMu.Unlock()
-	return r.idleActive[accountID]
 }
 
 func (r *Runtime) stopIdleWatcher(accountID string) {
@@ -499,7 +492,6 @@ func (r *Runtime) stopIdleWatcher(accountID string) {
 	watcher, ok := r.idleWatchers[accountID]
 	if ok {
 		delete(r.idleWatchers, accountID)
-		delete(r.idleActive, accountID)
 	}
 	r.idleMu.Unlock()
 	if ok {
@@ -514,7 +506,6 @@ func (r *Runtime) stopAllIdleWatchers() {
 		watchers = append(watchers, watcher)
 	}
 	clear(r.idleWatchers)
-	clear(r.idleActive)
 	r.idleMu.Unlock()
 	for _, watcher := range watchers {
 		watcher.cancel()
@@ -528,7 +519,6 @@ func (r *Runtime) removeIdleWatchersNotIn(accounts map[string]struct{}) {
 		if _, ok := accounts[accountID]; !ok {
 			stale = append(stale, watcher)
 			delete(r.idleWatchers, accountID)
-			delete(r.idleActive, accountID)
 		}
 	}
 	r.idleMu.Unlock()

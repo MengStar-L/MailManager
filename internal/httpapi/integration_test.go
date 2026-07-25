@@ -170,7 +170,7 @@ func newHTTPFixture(t *testing.T) *httpFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	repo := repository.New(database.DB())
+	repo := repository.New(database)
 	runtime := &stubMailRuntime{}
 	updateService := &stubUpdateService{status: updater.Status{
 		CurrentVersion: "1.0.0", CurrentCommit: "test-commit", CurrentBuildTime: "2026-07-13T00:00:00Z",

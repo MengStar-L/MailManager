@@ -479,6 +479,61 @@ func TestSystemStatus(t *testing.T) {
 	}
 }
 
+func TestRepositoryWritesUseStoreCoordinator(t *testing.T) {
+	ctx := context.Background()
+	database, err := store.OpenWithOptions(ctx, filepath.Join(t.TempDir(), "mailmanager.db"), store.Options{
+		BusyTimeout: 25 * time.Millisecond, MaxOpenConns: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repository := New(database)
+	account, err := repository.CreateAccount(ctx, AccountInput{
+		DisplayName: "Owner", Email: "owner@example.com", Provider: "imap", Color: "#336699",
+		AuthType: "password", IMAPHost: "imap.example.com", IMAPPort: 993,
+		SMTPHost: "smtp.example.com", SMTPPort: 465, CredentialEncrypted: []byte("secret"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- database.WriteTx(ctx, func(tx *sql.Tx) error {
+			if _, err := tx.ExecContext(ctx, `UPDATE accounts SET updated_at = updated_at + 1 WHERE id = ?`, account.ID); err != nil {
+				return err
+			}
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	<-entered
+
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- repository.UpdateAccountStatus(ctx, account.ID, "ready", "") }()
+	select {
+	case err := <-secondDone:
+		close(release)
+		<-firstDone
+		t.Fatalf("repository write bypassed store coordinator: %v", err)
+	case <-time.After(75 * time.Millisecond):
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func newTestRepository(t *testing.T) (context.Context, *Repository, *sql.DB) {
 	t.Helper()
 	ctx := context.Background()
@@ -494,7 +549,7 @@ func newTestRepository(t *testing.T) (context.Context, *Repository, *sql.DB) {
 	if err := database.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	return ctx, New(database.DB()), database.DB()
+	return ctx, New(database), database.DB()
 }
 
 func createTestAccount(t *testing.T, ctx context.Context, repository *Repository, email string) (string, string) {

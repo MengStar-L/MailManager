@@ -94,7 +94,7 @@ func serve() error {
 		logger.Warn("administrator setup is required", "token_file", bootstrapResult.Path)
 	}
 
-	repo := repository.New(database.DB())
+	repo := repository.New(database)
 	eventHub := events.NewHub(1000)
 	oauthService, err := oauthflow.New(database, cipher, cfg.PublicURL)
 	if err != nil {

@@ -220,6 +220,29 @@ func TestFolderSynchronizerIncrementalAndUIDValidityChange(t *testing.T) {
 	}
 }
 
+func TestFolderSynchronizerIncrementalSkipsFullReconciliation(t *testing.T) {
+	checkpoint := Checkpoint{AccountID: "account", FolderID: "folder", UIDValidity: 4, UIDNext: 19, LastUID: 18}
+	session := &fakeIngestSession{
+		state:    connectors.MailboxState{UIDValidity: 4, UIDNext: 20},
+		messages: map[uint32]connectors.RemoteMessage{19: {UID: 19, TextBody: "new"}},
+	}
+	sink := &fakeIngestSink{}
+	request := FolderSyncRequest{
+		AccountID: "account", FolderID: "folder", Mailbox: "INBOX",
+		Checkpoint: checkpoint, Now: time.Now().UTC(),
+	}
+	next, err := (FolderSynchronizer{BatchSize: 10}).SyncIncremental(context.Background(), session, sink, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.LastUID != 19 || len(sink.storedMessages) != 1 {
+		t.Fatalf("incremental result = %#v, stored = %d", next, len(sink.storedMessages))
+	}
+	if len(session.searchRequests) != 0 || len(session.stateRequests) != 0 || len(sink.reconciliations) != 0 {
+		t.Fatal("fast sync performed full folder reconciliation")
+	}
+}
+
 func TestFolderSynchronizerRefreshesBodiesByExplicitUID(t *testing.T) {
 	const lastUID = uint32(1_767_690_355)
 	checkpoint := Checkpoint{

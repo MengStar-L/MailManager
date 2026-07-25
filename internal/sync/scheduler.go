@@ -9,7 +9,7 @@ import (
 
 const (
 	DefaultWorkerLimit      = 4
-	InboxPollInterval       = 5 * time.Minute
+	InboxPollInterval       = time.Minute
 	FolderReconcileInterval = 15 * time.Minute
 )
 

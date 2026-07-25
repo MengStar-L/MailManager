@@ -28,7 +28,7 @@ func TestStoreMessagesMakesConversationSearchable(t *testing.T) {
 	if err := database.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	repo := repository.New(database.DB())
+	repo := repository.New(database)
 	account, err := repo.CreateAccount(ctx, repository.AccountInput{
 		DisplayName: "Work", Email: "work@example.com", Provider: "imap", Color: "#315B7D",
 		AuthType: "password", IMAPHost: "imap.example.com", IMAPPort: 993,
@@ -87,7 +87,7 @@ func TestStoreMessagesDeduplicatesGmailFolderCopies(t *testing.T) {
 	if err := database.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	repo := repository.New(database.DB())
+	repo := repository.New(database)
 	account, err := repo.CreateAccount(ctx, repository.AccountInput{
 		DisplayName: "Gmail", Email: "owner@gmail.com", Provider: string(accounts.ProviderGoogle), Color: "#315B7D",
 		AuthType: "password", IMAPHost: "imap.gmail.com", IMAPPort: 993,
@@ -387,7 +387,7 @@ func newIngestFixture(t *testing.T) (*baseStore.Store, *repository.Repository, *
 		database.Close()
 		t.Fatal(err)
 	}
-	repo := repository.New(database.DB())
+	repo := repository.New(database)
 	account, err := repo.CreateAccount(ctx, repository.AccountInput{
 		DisplayName: "Work", Email: "work@example.com", Provider: "imap", Color: "#315B7D",
 		AuthType: "password", IMAPHost: "imap.example.com", IMAPPort: 993,

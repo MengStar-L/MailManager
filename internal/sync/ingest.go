@@ -72,6 +72,14 @@ type bodyPartFetcher interface {
 }
 
 func (s FolderSynchronizer) Sync(ctx context.Context, session IngestSession, sink IngestSink, request FolderSyncRequest) (Checkpoint, error) {
+	return s.sync(ctx, session, sink, request, true)
+}
+
+func (s FolderSynchronizer) SyncIncremental(ctx context.Context, session IngestSession, sink IngestSink, request FolderSyncRequest) (Checkpoint, error) {
+	return s.sync(ctx, session, sink, request, false)
+}
+
+func (s FolderSynchronizer) sync(ctx context.Context, session IngestSession, sink IngestSink, request FolderSyncRequest, reconcile bool) (Checkpoint, error) {
 	if session == nil || sink == nil {
 		return Checkpoint{}, errors.New("IMAP session and ingest sink are required")
 	}
@@ -128,8 +136,10 @@ func (s FolderSynchronizer) Sync(ctx context.Context, session IngestSession, sin
 			return Checkpoint{}, err
 		}
 	}
-	if err := s.reconcileFolder(ctx, session, sink, request, state.UIDValidity, batchSize); err != nil {
-		return Checkpoint{}, err
+	if reconcile {
+		if err := s.reconcileFolder(ctx, session, sink, request, state.UIDValidity, batchSize); err != nil {
+			return Checkpoint{}, err
+		}
 	}
 
 	next := decision.Checkpoint
