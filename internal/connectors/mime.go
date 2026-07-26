@@ -167,11 +167,17 @@ func addresses(header messageMail.Header, key string) []Address {
 // library used, so identifiers keep their historical shape; parse failures
 // yield missing fields rather than errors.
 func envelopeFromHeader(raw []byte) RemoteEnvelope {
-	if len(raw) == 0 {
+	// Header sections arrive with provider-dependent framing: some servers
+	// omit the delimiting blank line, others prepend one. Normalize so the
+	// parser always sees terminated headers, and keep whatever fields parsed
+	// even when the tail of the header is malformed.
+	trimmed := bytes.TrimLeft(raw, "\r\n")
+	if len(trimmed) == 0 {
 		return RemoteEnvelope{}
 	}
-	entity, err := message.Read(bytes.NewReader(append(append([]byte(nil), raw...), '\r', '\n')))
-	if entity == nil || (err != nil && !message.IsUnknownCharset(err)) {
+	source := append(append([]byte(nil), trimmed...), '\r', '\n', '\r', '\n')
+	entity, _ := message.Read(bytes.NewReader(source))
+	if entity == nil {
 		return RemoteEnvelope{}
 	}
 	header := messageMail.Header{Header: entity.Header}

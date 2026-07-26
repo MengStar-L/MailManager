@@ -183,3 +183,20 @@ func TestEnvelopeFromHeaderSalvagesRawGBKAddresses(t *testing.T) {
 		t.Fatalf("subject = %q", envelope.Subject)
 	}
 }
+
+func TestEnvelopeFromHeaderToleratesProviderFraming(t *testing.T) {
+	// No trailing blank line, not even a final CRLF.
+	bare := envelopeFromHeader([]byte("From: a@qq.com\r\nSubject: no terminator"))
+	if bare.Subject != "no terminator" || len(bare.From) != 1 || bare.From[0].Email != "a@qq.com" {
+		t.Fatalf("unterminated header lost fields: %#v", bare)
+	}
+	// Leading blank line before the fields (seen from lax servers).
+	led := envelopeFromHeader([]byte("\r\nFrom: b@qq.com\r\nSubject: led\r\n\r\n"))
+	if led.Subject != "led" || len(led.From) != 1 || led.From[0].Email != "b@qq.com" {
+		t.Fatalf("leading blank line swallowed the header: %#v", led)
+	}
+	// Only framing bytes.
+	if empty := envelopeFromHeader([]byte("\r\n\r\n")); empty.Subject != "" || len(empty.From) != 0 {
+		t.Fatalf("framing-only header produced %#v", empty)
+	}
+}

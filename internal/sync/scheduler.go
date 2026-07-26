@@ -8,8 +8,10 @@ import (
 )
 
 const (
-	DefaultWorkerLimit      = 4
-	InboxPollInterval       = time.Minute
+	DefaultWorkerLimit = 4
+	// Polls ride the pooled per-account connection (NOOP + SELECT + SEARCH),
+	// so a short interval no longer multiplies logins.
+	InboxPollInterval       = 30 * time.Second
 	FolderReconcileInterval = 15 * time.Minute
 )
 

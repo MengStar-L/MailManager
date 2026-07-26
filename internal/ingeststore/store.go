@@ -497,6 +497,30 @@ func (s *Store) storeMessage(ctx context.Context, tx *sql.Tx, batch mailSync.Mes
 				search.IndexText(remote.TextBody), existingMessageID); err != nil {
 				return "", err
 			}
+			// A refresh also re-derives envelope metadata, but only with a
+			// non-empty envelope: overwriting good rows with a failed header
+			// parse would repeat the damage this pass exists to heal.
+			if remote.Envelope.Subject != "" || len(remote.Envelope.From) > 0 {
+				preview := compactPreview(firstNonEmpty(remote.TextBody, remote.Envelope.Subject))
+				if _, err := tx.ExecContext(ctx, `
+					UPDATE messages SET subject = ?, from_json = ?, to_json = ?, cc_json = ?, reply_to_json = ?,
+					       sent_at = ?, preview = ?, updated_at = ? WHERE id = ?`,
+					remote.Envelope.Subject, addressesJSON(remote.Envelope.From), addressesJSON(remote.Envelope.To),
+					addressesJSON(remote.Envelope.Cc), addressesJSON(remote.Envelope.ReplyTo),
+					nullTime(remote.Envelope.Date), preview, now, existingMessageID); err != nil {
+					return "", err
+				}
+				if _, err := tx.ExecContext(ctx, `
+					UPDATE message_search SET subject_tokens = ?, address_tokens = ? WHERE message_id = ?`,
+					search.IndexText(remote.Envelope.Subject),
+					search.IndexText(addressText(remote.Envelope.From, remote.Envelope.To, remote.Envelope.Cc)),
+					existingMessageID); err != nil {
+					return "", err
+				}
+				if err := refreshConversation(ctx, tx, existingConversationID); err != nil {
+					return "", err
+				}
+			}
 			return existingConversationID, nil
 		}
 		if _, err := tx.ExecContext(ctx, `
@@ -504,6 +528,32 @@ func (s *Store) storeMessage(ctx context.Context, tx *sql.Tx, batch mailSync.Mes
 			       seen = ?, flagged = ?, updated_at = ? WHERE id = ?`,
 			gmailMessageID, seen, starred, time.Now().UTC().UnixMilli(), existingMessageID); err != nil {
 			return "", err
+		}
+		// Heal envelope metadata an earlier degraded header parse stored
+		// empty once a later fetch derives it.
+		if remote.Envelope.Subject != "" || len(remote.Envelope.From) > 0 {
+			result, err := tx.ExecContext(ctx, `
+				UPDATE messages SET subject = ?, from_json = ?, to_json = ?, cc_json = ?, reply_to_json = ?,
+				       sent_at = ?, updated_at = ?
+				WHERE id = ? AND subject = '' AND from_json = '[]'`,
+				remote.Envelope.Subject, addressesJSON(remote.Envelope.From), addressesJSON(remote.Envelope.To),
+				addressesJSON(remote.Envelope.Cc), addressesJSON(remote.Envelope.ReplyTo),
+				nullTime(remote.Envelope.Date), time.Now().UTC().UnixMilli(), existingMessageID)
+			if err != nil {
+				return "", err
+			}
+			if healed, err := result.RowsAffected(); err == nil && healed > 0 {
+				if _, err := tx.ExecContext(ctx, `
+					UPDATE message_search SET subject_tokens = ?, address_tokens = ? WHERE message_id = ?`,
+					search.IndexText(remote.Envelope.Subject),
+					search.IndexText(addressText(remote.Envelope.From, remote.Envelope.To, remote.Envelope.Cc)),
+					existingMessageID); err != nil {
+					return "", err
+				}
+				if err := refreshConversation(ctx, tx, existingConversationID); err != nil {
+					return "", err
+				}
+			}
 		}
 		// Heal a message an earlier degraded sync attempt stored without a
 		// body once a later fetch delivers one.

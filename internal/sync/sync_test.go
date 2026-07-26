@@ -60,10 +60,10 @@ func TestBackoffAndMailboxSchedule(t *testing.T) {
 	if schedule := ScheduleForMailbox(true, true); schedule.Mode != ScheduleIdle {
 		t.Fatalf("Inbox did not use IDLE: %#v", schedule)
 	}
-	if InboxPollInterval != time.Minute {
-		t.Fatalf("Inbox poll interval = %s, want 1m", InboxPollInterval)
+	if InboxPollInterval != 30*time.Second {
+		t.Fatalf("Inbox poll interval = %s, want 30s", InboxPollInterval)
 	}
-	if schedule := ScheduleForMailbox(true, false); schedule.Interval != time.Minute {
+	if schedule := ScheduleForMailbox(true, false); schedule.Interval != 30*time.Second {
 		t.Fatalf("Inbox fallback interval = %s", schedule.Interval)
 	}
 	if schedule := ScheduleForMailbox(false, true); schedule.Interval != 15*time.Minute {

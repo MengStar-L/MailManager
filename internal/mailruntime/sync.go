@@ -473,12 +473,21 @@ func (r *Runtime) scheduleInboxPolling(ctx context.Context) {
 		}
 		folders, err := r.ingest.Folders(ctx, account.ID)
 		if err != nil || len(folders) == 0 {
-			_ = r.enqueueSync(ctx, syncJob{accountID: account.ID, kind: syncDiscover})
+			discover := syncJob{accountID: account.ID, kind: syncDiscover}
+			if r.jobFailures(discover) == 0 {
+				_ = r.enqueueSync(ctx, discover)
+			}
 			continue
 		}
 		for _, folder := range folders {
 			if folder.Role == "inbox" {
-				_ = r.enqueueSync(ctx, syncJob{accountID: account.ID, folderID: folder.ID, mailbox: folder.RemoteName, kind: syncFolder})
+				job := syncJob{accountID: account.ID, folderID: folder.ID, mailbox: folder.RemoteName, kind: syncFolder}
+				// A failing job belongs to its backoff timer: re-enqueueing
+				// it every poll tick would hammer a throttling provider with
+				// fresh login attempts at the poll cadence.
+				if r.jobFailures(job) == 0 {
+					_ = r.enqueueSync(ctx, job)
+				}
 				break
 			}
 		}

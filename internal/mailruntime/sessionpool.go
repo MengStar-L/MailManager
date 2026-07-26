@@ -10,12 +10,21 @@ import (
 
 const (
 	// sessionMaxAge bounds reuse so credential changes and provider-side
-	// connection state (e.g. QQ serving stale mailbox views on long-lived
-	// connections) are refreshed on a fresh login.
-	sessionMaxAge       = 10 * time.Minute
+	// connection state are refreshed on a fresh login.
+	sessionMaxAge = 10 * time.Minute
+	// QQ's server is community-documented to serve stale mailbox views on
+	// long-lived connections, so its sessions recycle much sooner.
+	sessionMaxAgeQQ     = 2 * time.Minute
 	sessionMaxIdle      = 5 * time.Minute
 	sessionProbeTimeout = 30 * time.Second
 )
+
+func sessionMaxAgeFor(provider accounts.Provider) time.Duration {
+	if provider == accounts.ProviderQQ {
+		return sessionMaxAgeQQ
+	}
+	return sessionMaxAge
+}
 
 // pooledSession is a per-account foreground IMAP connection reused across
 // poll ticks so each account performs a handful of logins per hour instead of
@@ -51,7 +60,7 @@ func (r *Runtime) acquireSession(ctx context.Context, accountID string, config a
 	delete(r.sessions, accountID)
 	r.poolMu.Unlock()
 	if entry != nil {
-		if entry.identity == identity && time.Since(entry.dialed) < sessionMaxAge {
+		if entry.identity == identity && time.Since(entry.dialed) < sessionMaxAgeFor(config.Provider) {
 			probeCtx, cancel := context.WithTimeout(ctx, sessionProbeTimeout)
 			err := entry.session.Noop(probeCtx)
 			cancel()

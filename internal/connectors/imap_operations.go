@@ -320,7 +320,12 @@ func collectRemoteMessage(data *imapclient.FetchMessageData, headerSection *imap
 		case imapclient.FetchItemDataBodyStructure:
 			message.Parts = remoteParts(item.BodyStructure)
 		case imapclient.FetchItemDataBodySection:
-			if !item.MatchCommand(headerSection) {
+			// Exactly one body section is requested, so any body-section item
+			// belongs to it. Some servers (QQ) echo the HEADER.FIELDS section
+			// spec in a shape strict matching does not recognize, which would
+			// silently drop the header and with it the derived envelope.
+			matched := item.MatchCommand(headerSection)
+			if message.Header != nil && !matched {
 				if item.Literal != nil {
 					_, _ = io.Copy(io.Discard, item.Literal)
 				}
@@ -328,6 +333,13 @@ func collectRemoteMessage(data *imapclient.FetchMessageData, headerSection *imap
 			}
 			if item.Literal != nil {
 				if item.Literal.Size() > maximumHeaderBytes {
+					if !matched {
+						// A fallback-accepted section of unexpected size is
+						// discarded, degrading this message to an empty
+						// envelope instead of failing the whole batch.
+						_, _ = io.Copy(io.Discard, item.Literal)
+						continue
+					}
 					return RemoteMessage{}, fmt.Errorf("message header exceeds %d byte limit", maximumHeaderBytes)
 				}
 				header, err := readAtMost(item.Literal, maximumHeaderBytes)
