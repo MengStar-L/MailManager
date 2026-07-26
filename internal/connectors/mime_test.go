@@ -117,3 +117,69 @@ func TestSandboxedDocumentHasRestrictiveCSP(t *testing.T) {
 		t.Fatalf("missing restrictive CSP: %s", document)
 	}
 }
+
+func TestEnvelopeFromHeaderParsesStandardAndDegradesGracefully(t *testing.T) {
+	header := []byte("Date: Sat, 26 Jul 2026 10:30:00 +0800\r\n" +
+		"Subject: =?utf-8?B?5L2g5aW977yM5LiW55WM?=\r\n" +
+		"From: \"Zhang San\" <zhangsan@qq.com>\r\n" +
+		"To: work@example.com, \"Li Si\" <lisi@163.com>\r\n" +
+		"Cc: =?gb2312?B?zfXO5Q==?= <wangwu@qq.com>\r\n" +
+		"Message-ID: <Poison.123@qq.com>\r\n" +
+		"In-Reply-To: <parent.456@qq.com>\r\n" +
+		"Content-Type: text/plain\r\n\r\n")
+	envelope := envelopeFromHeader(header)
+	if envelope.Subject != "你好，世界" {
+		t.Fatalf("subject = %q", envelope.Subject)
+	}
+	if len(envelope.From) != 1 || envelope.From[0].Email != "zhangsan@qq.com" || envelope.From[0].Name != "Zhang San" {
+		t.Fatalf("from = %#v", envelope.From)
+	}
+	if len(envelope.To) != 2 || envelope.To[1].Email != "lisi@163.com" {
+		t.Fatalf("to = %#v", envelope.To)
+	}
+	if envelope.MessageID != "Poison.123@qq.com" {
+		t.Fatalf("message id = %q (angle brackets must be stripped, case preserved)", envelope.MessageID)
+	}
+	if len(envelope.InReplyTo) != 1 || envelope.InReplyTo[0] != "parent.456@qq.com" {
+		t.Fatalf("in-reply-to = %#v", envelope.InReplyTo)
+	}
+	if envelope.Date.IsZero() {
+		t.Fatal("date was not parsed")
+	}
+
+	// Unparseable address values degrade field-wise; the rest of the header
+	// still yields data and no error reaches the sync pipeline.
+	badAddress := envelopeFromHeader([]byte("From: broken <<>>\r\nSubject: still here\r\n\r\n"))
+	if badAddress.Subject != "still here" {
+		t.Fatalf("bad address value did not degrade field-wise: %#v", badAddress)
+	}
+	if len(badAddress.From) != 0 {
+		t.Fatalf("unparseable address should be dropped, got %#v", badAddress.From)
+	}
+	// Broken header syntax degrades to an empty envelope, never an error.
+	if malformed := envelopeFromHeader([]byte("Not A Header Line At All")); malformed.Subject != "" || len(malformed.From) != 0 {
+		t.Fatalf("malformed header should yield an empty envelope, got %#v", malformed)
+	}
+	if envelope := envelopeFromHeader(nil); envelope.Subject != "" || len(envelope.From) != 0 {
+		t.Fatalf("empty header produced %#v", envelope)
+	}
+}
+
+func TestEnvelopeFromHeaderSalvagesRawGBKAddresses(t *testing.T) {
+	// Unencoded GBK display names (old Foxmail-era mail) hard-fail strict
+	// address parsing; the addr-specs must survive with the names dropped.
+	header := append([]byte("From: "), 0xd5, 0xc5, 0xc8, 0xfd)
+	header = append(header, []byte(" <zhangsan@qq.com>\r\nTo: good@qq.com, ")...)
+	header = append(header, 0xd5, 0xc5)
+	header = append(header, []byte(" <bad@qq.com>\r\nSubject: legacy\r\n\r\n")...)
+	envelope := envelopeFromHeader(header)
+	if len(envelope.From) != 1 || envelope.From[0].Email != "zhangsan@qq.com" {
+		t.Fatalf("raw-GBK sender was lost: %#v", envelope.From)
+	}
+	if len(envelope.To) != 2 || envelope.To[0].Email != "good@qq.com" || envelope.To[1].Email != "bad@qq.com" {
+		t.Fatalf("one bad entry poisoned the recipient list: %#v", envelope.To)
+	}
+	if envelope.Subject != "legacy" {
+		t.Fatalf("subject = %q", envelope.Subject)
+	}
+}

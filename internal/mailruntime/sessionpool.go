@@ -31,10 +31,19 @@ func sessionIdentity(config accounts.Config) string {
 	return config.IMAP.Address() + "\x00" + config.Credentials.Username
 }
 
-// acquireSession checks the account's cached session out of the pool,
-// verifying it with NOOP, and dials a fresh one when there is none, it aged
-// out, the account identity changed, or the probe fails. Callers must hold
-// the account's foreground lock and hand the session back via releaseSession.
+// backgroundPoolKey namespaces the pool slot used by serialized background
+// jobs (reconcile, backfill) so they share one connection per account without
+// ever holding the foreground new-mail session.
+func backgroundPoolKey(accountID string) string {
+	return "bg\x00" + accountID
+}
+
+// acquireSession checks the slot's cached session out of the pool, verifying
+// it with NOOP, and dials a fresh one when there is none, it aged out, the
+// account identity changed, or the probe fails. Access to a slot must be
+// serialized by its owning lock: the foreground account lock for plain
+// account keys, the background lock for backgroundPoolKey slots. Hand the
+// session back via releaseSession.
 func (r *Runtime) acquireSession(ctx context.Context, accountID string, config accounts.Config) (*pooledSession, error) {
 	identity := sessionIdentity(config)
 	r.poolMu.Lock()

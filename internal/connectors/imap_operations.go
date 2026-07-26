@@ -25,6 +25,11 @@ const (
 	maximumHeaderBytes int64 = 256 << 10
 )
 
+// ErrSearchOverflow reports a UID SEARCH whose result exceeds the safety
+// limit. Callers that can degrade (skip a reconcile pass, defer a body
+// refresh) should treat it as a signal rather than a hard failure.
+var ErrSearchOverflow = errors.New("IMAP search result exceeds the UID limit")
+
 func (s *emersionIMAPSession) ListMailboxes(ctx context.Context) ([]RemoteMailbox, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -88,7 +93,7 @@ func (s *emersionIMAPSession) SearchUIDs(ctx context.Context, request SearchRequ
 	uids := data.AllUIDs()
 	if len(uids) > limit {
 		if request.FromUID == 0 {
-			return nil, fmt.Errorf("search returned %d UIDs, exceeding limit %d", len(uids), limit)
+			return nil, fmt.Errorf("search returned %d UIDs, exceeding limit %d: %w", len(uids), limit, ErrSearchOverflow)
 		}
 		// An incremental probe over a huge backlog must make forward
 		// progress instead of failing forever: keep the lowest UIDs so the
@@ -135,8 +140,13 @@ func (s *emersionIMAPSession) FetchMessages(ctx context.Context, request FetchRe
 		},
 		Partial: &imap.SectionPartial{Offset: 0, Size: maximumHeaderBytes}, Peek: true,
 	}
+	// ENVELOPE is deliberately not requested: some providers (QQ) serialize
+	// it malformed for certain messages, which kills the wire parser and with
+	// it the whole batch. The raw header fields fetched below carry the same
+	// information as opaque bytes, so a bad message degrades to missing
+	// fields instead of a permanently failing folder.
 	command := s.client.Fetch(set, &imap.FetchOptions{
-		UID: true, Flags: true, Envelope: true, InternalDate: true, RFC822Size: true,
+		UID: true, Flags: true, InternalDate: true, RFC822Size: true,
 		BodyStructure: &imap.FetchItemBodyStructure{Extended: true}, BodySection: []*imap.FetchItemBodySection{headerSection},
 		ModSeq: request.ChangedSince != 0, ChangedSince: request.ChangedSince, GmailMessageID: fetchGmailMessageID,
 	})
@@ -151,6 +161,7 @@ func (s *emersionIMAPSession) FetchMessages(ctx context.Context, request FetchRe
 			_ = command.Close()
 			return nil, fmt.Errorf("collect IMAP message metadata: %w", err)
 		}
+		message.Envelope = envelopeFromHeader(message.Header)
 		if len(messages) >= limit {
 			_ = command.Close()
 			return nil, fmt.Errorf("fetch returned more than %d messages", limit)

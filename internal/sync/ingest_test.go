@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -16,6 +17,8 @@ type fakeIngestSession struct {
 	messages       map[uint32]connectors.RemoteMessage
 	messageStates  map[uint32]connectors.RemoteMessageState
 	partBodies     map[int][]byte
+	partFailures   map[uint32]error
+	searchOverflow bool
 	partRequests   [][]int
 	searchRequests []connectors.SearchRequest
 	fetchRequests  []connectors.FetchRequest
@@ -43,6 +46,9 @@ func (s *fakeIngestSession) SearchUIDs(_ context.Context, request connectors.Sea
 		return result, nil
 	}
 	if request.Since.IsZero() && request.Before.IsZero() {
+		if s.searchOverflow {
+			return nil, connectors.ErrSearchOverflow
+		}
 		return append([]uint32(nil), s.allUIDs...), nil
 	}
 	return append([]uint32(nil), s.searchUIDs...), nil
@@ -66,8 +72,11 @@ func (s *fakeIngestSession) FetchMessages(_ context.Context, request connectors.
 	return messages, nil
 }
 
-func (s *fakeIngestSession) FetchPart(_ context.Context, _ uint32, path []int, _ int64) ([]byte, error) {
+func (s *fakeIngestSession) FetchPart(_ context.Context, uid uint32, path []int, _ int64) ([]byte, error) {
 	s.partRequests = append(s.partRequests, append([]int(nil), path...))
+	if err := s.partFailures[uid]; err != nil {
+		return nil, err
+	}
 	if len(path) == 0 {
 		return nil, nil
 	}
@@ -335,5 +344,132 @@ func TestFolderSynchronizerReconcilesFlagsAndExpungesWithoutUIDNextChange(t *tes
 	snapshot := sink.reconciliations[0]
 	if len(snapshot.RemoteUIDs) != 1 || snapshot.RemoteUIDs[0] != 5 || len(snapshot.States) != 1 || snapshot.States[0].ModSeq != 11 {
 		t.Fatalf("unexpected folder snapshot: %#v", snapshot)
+	}
+}
+
+func TestFolderSynchronizerSkipsBodyOfPoisonMessageWithoutFailingFolder(t *testing.T) {
+	parts := []connectors.RemotePart{{Path: []int{1}, MediaType: "text/plain", Size: 10}}
+	checkpoint := Checkpoint{AccountID: "account", FolderID: "folder", UIDValidity: 4, UIDNext: 19, LastUID: 18}
+	session := &fakeIngestSession{
+		state:   connectors.MailboxState{UIDValidity: 4, UIDNext: 22},
+		allUIDs: []uint32{19, 20, 21},
+		messages: map[uint32]connectors.RemoteMessage{
+			19: {Parts: parts}, 20: {Parts: parts}, 21: {Parts: parts},
+		},
+		partBodies:   map[int][]byte{1: []byte("body")},
+		partFailures: map[uint32]error{20: errors.New("malformed message")},
+	}
+	sink := &fakeIngestSink{}
+	strictRequest := FolderSyncRequest{
+		AccountID: "account", FolderID: "folder", Mailbox: "INBOX",
+		Checkpoint: checkpoint, Now: time.Now().UTC(),
+	}
+	if _, err := (FolderSynchronizer{BatchSize: 10}).SyncIncremental(context.Background(), session, sink, strictRequest); err == nil {
+		t.Fatal("first attempt must fail so a transient error gets a clean retry")
+	}
+
+	session.partRequests, sink.storedMessages, sink.batches = nil, nil, nil
+	lenientRequest := strictRequest
+	lenientRequest.AllowDegradedBodies = true
+	next, err := (FolderSynchronizer{BatchSize: 10}).SyncIncremental(context.Background(), session, sink, lenientRequest)
+	if err != nil {
+		t.Fatalf("a single poison message failed the folder on retry: %v", err)
+	}
+	if next.LastUID != 21 || len(sink.storedMessages) != 3 {
+		t.Fatalf("degraded sync result = %#v, stored = %d", next, len(sink.storedMessages))
+	}
+	bodies := map[uint32]string{}
+	for index, batch := range sink.batches {
+		bodies[uint32(19+index)] = sink.storedMessages[index].TextBody
+		_ = batch
+	}
+	if bodies[19] != "body" || bodies[20] != "" || bodies[21] != "body" {
+		t.Fatalf("unexpected stored bodies: %#v", bodies)
+	}
+}
+
+func TestFolderSynchronizerFailsWhenEveryBodyFetchFails(t *testing.T) {
+	parts := []connectors.RemotePart{{Path: []int{1}, MediaType: "text/plain", Size: 10}}
+	checkpoint := Checkpoint{AccountID: "account", FolderID: "folder", UIDValidity: 4, UIDNext: 19, LastUID: 18}
+	failure := errors.New("connection reset")
+	session := &fakeIngestSession{
+		state:   connectors.MailboxState{UIDValidity: 4, UIDNext: 23},
+		allUIDs: []uint32{19, 20, 21, 22},
+		messages: map[uint32]connectors.RemoteMessage{
+			19: {Parts: parts}, 20: {Parts: parts}, 21: {Parts: parts}, 22: {Parts: parts},
+		},
+		partFailures: map[uint32]error{19: failure, 20: failure, 21: failure, 22: failure},
+	}
+	sink := &fakeIngestSink{}
+	_, err := (FolderSynchronizer{BatchSize: 10}).SyncIncremental(context.Background(), session, sink, FolderSyncRequest{
+		AccountID: "account", FolderID: "folder", Mailbox: "INBOX",
+		Checkpoint: checkpoint, Now: time.Now().UTC(), AllowDegradedBodies: true,
+	})
+	if err == nil {
+		t.Fatal("consecutive body-fetch failures were not treated as a connection problem")
+	}
+	if len(sink.storedMessages) != maxConsecutiveBodyFailures-1 {
+		t.Fatalf("stored %d degraded messages before aborting, want %d", len(sink.storedMessages), maxConsecutiveBodyFailures-1)
+	}
+}
+
+func TestFolderSynchronizerDegradedRefreshDoesNotOverwriteStoredBodies(t *testing.T) {
+	parts := []connectors.RemotePart{{Path: []int{1}, MediaType: "text/plain", Size: 10}}
+	checkpoint := Checkpoint{
+		AccountID: "account", FolderID: "folder", UIDValidity: 4,
+		UIDNext: 21, LastUID: 20, BodyRefreshRequired: true,
+	}
+	session := &fakeIngestSession{
+		state:        connectors.MailboxState{UIDValidity: 4, UIDNext: 21},
+		allUIDs:      []uint32{19, 20},
+		messages:     map[uint32]connectors.RemoteMessage{19: {Parts: parts}, 20: {Parts: parts}},
+		partBodies:   map[int][]byte{1: []byte("fresh body")},
+		partFailures: map[uint32]error{20: errors.New("transient NO")},
+	}
+	sink := &fakeIngestSink{}
+	if _, err := (FolderSynchronizer{BatchSize: 10}).Sync(context.Background(), session, sink, FolderSyncRequest{
+		AccountID: "account", FolderID: "folder", Mailbox: "INBOX",
+		Checkpoint: checkpoint, Now: time.Now().UTC(), AllowDegradedBodies: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.batches) != 2 {
+		t.Fatalf("stored %d messages during refresh, want 2", len(sink.batches))
+	}
+	if !sink.batches[0].RefreshBody {
+		t.Fatal("healthy message lost its refresh semantics")
+	}
+	if sink.batches[1].RefreshBody {
+		t.Fatal("degraded message kept refresh semantics and would wipe its stored body")
+	}
+}
+
+func TestFolderSynchronizerRefreshOverflowFallsBackToIncrementalProbe(t *testing.T) {
+	checkpoint := Checkpoint{
+		AccountID: "account", FolderID: "folder", UIDValidity: 4,
+		UIDNext: 19, LastUID: 18, BodyRefreshRequired: true,
+	}
+	session := &fakeIngestSession{
+		state:          connectors.MailboxState{UIDValidity: 4, UIDNext: 40},
+		allUIDs:        []uint32{19, 20},
+		messages:       map[uint32]connectors.RemoteMessage{19: {TextBody: "new"}, 20: {TextBody: "newer"}},
+		searchOverflow: true,
+	}
+	sink := &fakeIngestSink{}
+	next, err := (FolderSynchronizer{BatchSize: 10}).SyncIncremental(context.Background(), session, sink, FolderSyncRequest{
+		AccountID: "account", FolderID: "folder", Mailbox: "INBOX",
+		Checkpoint: checkpoint, Now: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("refresh overflow failed the sync: %v", err)
+	}
+	if len(sink.storedMessages) != 2 {
+		t.Fatalf("overflow fallback stored %d messages, want the 2 new ones", len(sink.storedMessages))
+	}
+	if next.LastUID != 20 {
+		t.Fatalf("LastUID = %d; must advance only over fetched UIDs, not to UIDNEXT-1=39", next.LastUID)
+	}
+	if next.BodyRefreshRequired {
+		t.Fatal("refresh flag must clear so the oversized folder does not loop")
 	}
 }

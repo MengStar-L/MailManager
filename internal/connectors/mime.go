@@ -9,12 +9,14 @@ import (
 	"mime"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
 	"unicode/utf8"
 
+	message "github.com/emersion/go-message"
 	messageMail "github.com/emersion/go-message/mail"
 	xhtml "golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
@@ -155,6 +157,74 @@ func addresses(header messageMail.Header, key string) []Address {
 	result := make([]Address, 0, len(values))
 	for _, value := range values {
 		result = append(result, Address{Name: value.Name, Email: value.Address})
+	}
+	return result
+}
+
+// envelopeFromHeader derives envelope metadata from the raw header bytes
+// fetched alongside each message, replacing the server-side ENVELOPE
+// structure. It uses the same go-message msg-id and address parsing the IMAP
+// library used, so identifiers keep their historical shape; parse failures
+// yield missing fields rather than errors.
+func envelopeFromHeader(raw []byte) RemoteEnvelope {
+	if len(raw) == 0 {
+		return RemoteEnvelope{}
+	}
+	entity, err := message.Read(bytes.NewReader(append(append([]byte(nil), raw...), '\r', '\n')))
+	if entity == nil || (err != nil && !message.IsUnknownCharset(err)) {
+		return RemoteEnvelope{}
+	}
+	header := messageMail.Header{Header: entity.Header}
+	parsed := parseHeaders(header)
+	return RemoteEnvelope{
+		Date:      parsed.Date.UTC(),
+		Subject:   parsed.Subject,
+		From:      remoteAddressList(envelopeAddresses(header, "From")),
+		Sender:    remoteAddressList(envelopeAddresses(header, "Sender")),
+		ReplyTo:   remoteAddressList(envelopeAddresses(header, "Reply-To")),
+		To:        remoteAddressList(envelopeAddresses(header, "To")),
+		Cc:        remoteAddressList(envelopeAddresses(header, "Cc")),
+		InReplyTo: parsed.InReplyTo,
+		MessageID: parsed.MessageID,
+	}
+}
+
+var addrSpecPattern = regexp.MustCompile(`[^\s<>,;:"'()\[\]]+@[^\s<>,;:"'()\[\]]+`)
+
+// envelopeAddresses parses an address header for envelope derivation. Strict
+// parsing hard-fails on headers common in Chinese-provider mail (raw GBK
+// display names), and one bad entry would drop the whole list — so on failure
+// the addr-specs are salvaged with the undecodable names discarded, matching
+// what server-side ENVELOPE parsing used to guarantee.
+func envelopeAddresses(header messageMail.Header, key string) []Address {
+	if values := addresses(header, key); len(values) > 0 {
+		return values
+	}
+	raw := header.Get(key)
+	if raw == "" {
+		return nil
+	}
+	matches := addrSpecPattern.FindAllString(raw, -1)
+	result := make([]Address, 0, len(matches))
+	seen := make(map[string]struct{}, len(matches))
+	for _, match := range matches {
+		email := strings.Trim(match, "<>")
+		lowered := strings.ToLower(email)
+		if _, ok := seen[lowered]; ok {
+			continue
+		}
+		seen[lowered] = struct{}{}
+		result = append(result, Address{Email: email})
+	}
+	return result
+}
+
+func remoteAddressList(values []Address) []RemoteAddress {
+	result := make([]RemoteAddress, 0, len(values))
+	for _, value := range values {
+		if value.Email != "" {
+			result = append(result, RemoteAddress{Name: value.Name, Email: value.Email})
+		}
 	}
 	return result
 }

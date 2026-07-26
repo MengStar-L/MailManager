@@ -1162,3 +1162,39 @@ func assertOperationSyncQueued(t *testing.T, runtime *Runtime, accountID string)
 		t.Fatalf("operation convergence sync was not queued: pending=%v queued=%d", pending, len(runtime.syncHigh))
 	}
 }
+
+func TestBackgroundJobFailureDoesNotFlipAccountStatus(t *testing.T) {
+	fixture := newRuntimeFixture(t)
+	account, _ := fixture.createPasswordAccount(t)
+	folders, err := fixture.runtime.ingest.UpsertFolders(context.Background(), account.ID, []connectors.RemoteMailbox{
+		{Name: "INBOX", Selectable: true, Role: accounts.FolderInbox},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.repo.UpdateAccountStatus(context.Background(), account.ID, "ready", ""); err != nil {
+		t.Fatal(err)
+	}
+	fixture.session.mu.Lock()
+	fixture.session.selectErrors = map[string]error{"INBOX": errors.New("mailbox unavailable")}
+	fixture.session.mu.Unlock()
+
+	statusAfter := func(kind syncJobKind) string {
+		job := syncJob{accountID: account.ID, folderID: folders[0].ID, mailbox: "INBOX", kind: kind}
+		if err := fixture.runtime.runSyncJob(context.Background(), job); err == nil {
+			t.Fatalf("job kind %d unexpectedly succeeded", kind)
+		}
+		items, err := fixture.repo.ListAccounts(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return items[0].Status
+	}
+
+	if status := statusAfter(syncReconcile); status != "ready" {
+		t.Fatalf("background reconcile failure flipped account status to %q", status)
+	}
+	if status := statusAfter(syncFolder); status != "error" {
+		t.Fatalf("foreground sync failure did not surface: status %q", status)
+	}
+}

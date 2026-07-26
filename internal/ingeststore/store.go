@@ -499,11 +499,31 @@ func (s *Store) storeMessage(ctx context.Context, tx *sql.Tx, batch mailSync.Mes
 			}
 			return existingConversationID, nil
 		}
-		_, err = tx.ExecContext(ctx, `
+		if _, err := tx.ExecContext(ctx, `
 			UPDATE messages SET gmail_message_id = COALESCE(gmail_message_id, NULLIF(?, '')),
 			       seen = ?, flagged = ?, updated_at = ? WHERE id = ?`,
-			gmailMessageID, seen, starred, time.Now().UTC().UnixMilli(), existingMessageID)
-		return existingConversationID, err
+			gmailMessageID, seen, starred, time.Now().UTC().UnixMilli(), existingMessageID); err != nil {
+			return "", err
+		}
+		// Heal a message an earlier degraded sync attempt stored without a
+		// body once a later fetch delivers one.
+		if remote.TextBody != "" || remote.HTMLBody != "" {
+			result, err := tx.ExecContext(ctx, `
+				UPDATE messages SET body_text = ?, body_html_clean = ?, search_tokens = ?, updated_at = ?
+				WHERE id = ? AND body_text = '' AND body_html_clean = ''`,
+				remote.TextBody, remote.HTMLBody, search.IndexText(remote.Envelope.Subject+" "+remote.TextBody),
+				time.Now().UTC().UnixMilli(), existingMessageID)
+			if err != nil {
+				return "", err
+			}
+			if healed, err := result.RowsAffected(); err == nil && healed > 0 {
+				if _, err := tx.ExecContext(ctx, `UPDATE message_search SET body_tokens = ? WHERE message_id = ?`,
+					search.IndexText(remote.TextBody), existingMessageID); err != nil {
+					return "", err
+				}
+			}
+		}
+		return existingConversationID, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return "", err

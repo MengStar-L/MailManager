@@ -31,6 +31,11 @@ type FolderSyncRequest struct {
 	Checkpoint          Checkpoint
 	PendingOperationIDs []string
 	Now                 time.Time
+	// AllowDegradedBodies lets a failing per-message body fetch store the
+	// message without a body instead of failing the folder. Callers set it on
+	// retry attempts only, so a transient failure gets one clean retry before
+	// a poison message is degraded permanently.
+	AllowDegradedBodies bool
 }
 
 type MessageBatch struct {
@@ -121,13 +126,24 @@ func (s FolderSynchronizer) sync(ctx context.Context, session IngestSession, sin
 
 	incrementalProbe := false
 	var highestFetched uint32
-	if request.Checkpoint.BodyRefreshRequired {
+	bodyRefresh := request.Checkpoint.BodyRefreshRequired
+	var refreshUIDs []uint32
+	if bodyRefresh {
 		uids, err := session.SearchUIDs(ctx, connectors.SearchRequest{Limit: maximumInitialUIDs})
-		if err != nil {
+		if errors.Is(err, connectors.ErrSearchOverflow) {
+			// A folder too large to enumerate keeps its stored bodies; new
+			// mail still syncs through the incremental path below, keeping
+			// checkpoint advancement tied to actually fetched UIDs.
+			bodyRefresh = false
+		} else if err != nil {
 			return Checkpoint{}, fmt.Errorf("search messages for body refresh: %w", err)
+		} else {
+			refreshUIDs = uids
 		}
-		highestFetched = maxUID(uids)
-		if err := s.fetchExplicitBatches(ctx, session, sink, request, state.UIDValidity, uids, batchSize, false); err != nil {
+	}
+	if bodyRefresh {
+		highestFetched = maxUID(refreshUIDs)
+		if err := s.fetchExplicitBatches(ctx, session, sink, request, state.UIDValidity, refreshUIDs, batchSize, false, true); err != nil {
 			return Checkpoint{}, err
 		}
 	} else if decision.Action == ReconcileInitialize || decision.Action == ReconcileRebuild {
@@ -137,7 +153,7 @@ func (s FolderSynchronizer) sync(ctx context.Context, session IngestSession, sin
 			return Checkpoint{}, fmt.Errorf("search recent messages: %w", err)
 		}
 		highestFetched = maxUID(uids)
-		if err := s.fetchExplicitBatches(ctx, session, sink, request, state.UIDValidity, uids, batchSize, false); err != nil {
+		if err := s.fetchExplicitBatches(ctx, session, sink, request, state.UIDValidity, uids, batchSize, false, false); err != nil {
 			return Checkpoint{}, err
 		}
 	} else {
@@ -157,7 +173,7 @@ func (s FolderSynchronizer) sync(ctx context.Context, session IngestSession, sin
 			}
 		}
 		highestFetched = maxUID(fresh)
-		if err := s.fetchExplicitBatches(ctx, session, sink, request, state.UIDValidity, fresh, batchSize, false); err != nil {
+		if err := s.fetchExplicitBatches(ctx, session, sink, request, state.UIDValidity, fresh, batchSize, false, false); err != nil {
 			return Checkpoint{}, err
 		}
 	}
@@ -224,7 +240,7 @@ func (s FolderSynchronizer) BackfillHistory(ctx context.Context, session IngestS
 	if batchSize > 1000 {
 		return errors.New("ingest batch size cannot exceed 1000")
 	}
-	return s.fetchExplicitBatches(ctx, session, sink, request, state.UIDValidity, uids, batchSize, true)
+	return s.fetchExplicitBatches(ctx, session, sink, request, state.UIDValidity, uids, batchSize, true, false)
 }
 
 func (s FolderSynchronizer) fetchExplicitBatches(
@@ -236,6 +252,7 @@ func (s FolderSynchronizer) fetchExplicitBatches(
 	uids []uint32,
 	batchSize int,
 	lowPriority bool,
+	refreshBody bool,
 ) error {
 	for start := 0; start < len(uids); start += batchSize {
 		end := start + batchSize
@@ -246,12 +263,16 @@ func (s FolderSynchronizer) fetchExplicitBatches(
 		if err != nil {
 			return fmt.Errorf("fetch IMAP message batch: %w", err)
 		}
-		if err := s.storeFetchedMessages(ctx, session, sink, request, uidValidity, messages, lowPriority); err != nil {
+		if err := s.storeFetchedMessages(ctx, session, sink, request, uidValidity, messages, lowPriority, refreshBody); err != nil {
 			return err
 		}
 	}
 	return nil
 }
+
+// maxConsecutiveBodyFailures separates a malformed message (skip its body,
+// keep syncing) from a dead connection (every fetch fails; abort).
+const maxConsecutiveBodyFailures = 3
 
 func (s FolderSynchronizer) storeFetchedMessages(
 	ctx context.Context,
@@ -261,16 +282,39 @@ func (s FolderSynchronizer) storeFetchedMessages(
 	uidValidity uint32,
 	messages []connectors.RemoteMessage,
 	lowPriority bool,
+	refreshBody bool,
 ) error {
+	consecutiveBodyFailures := 0
 	for index := range messages {
+		degraded := false
 		if err := s.fetchTextBody(ctx, session, &messages[index]); err != nil {
-			messages[index] = connectors.RemoteMessage{}
-			return fmt.Errorf("fetch IMAP text bodies: %w", err)
+			if ctx.Err() != nil {
+				messages[index] = connectors.RemoteMessage{}
+				return fmt.Errorf("fetch IMAP text bodies: %w", ctx.Err())
+			}
+			if !request.AllowDegradedBodies {
+				messages[index] = connectors.RemoteMessage{}
+				return fmt.Errorf("fetch IMAP text bodies: %w", err)
+			}
+			consecutiveBodyFailures++
+			if consecutiveBodyFailures >= maxConsecutiveBodyFailures {
+				messages[index] = connectors.RemoteMessage{}
+				return fmt.Errorf("fetch IMAP text bodies: %w", err)
+			}
+			// A poison message must not wedge the whole folder in a permanent
+			// retry loop; store it without a body.
+			degraded = true
+			messages[index].TextBody, messages[index].HTMLBody = "", ""
+			messages[index].RemoteImagesBlocked = false
+		} else {
+			consecutiveBodyFailures = 0
 		}
 		err := sink.StoreMessages(ctx, MessageBatch{
 			AccountID: request.AccountID, FolderID: request.FolderID, Provider: request.Provider, UIDValidity: uidValidity,
 			Messages: messages[index : index+1], LowPriority: lowPriority,
-			RefreshBody: request.Checkpoint.BodyRefreshRequired,
+			// A degraded message must never overwrite a previously stored
+			// body under refresh semantics.
+			RefreshBody: refreshBody && !degraded,
 		})
 		messages[index] = connectors.RemoteMessage{}
 		if err != nil {
@@ -340,6 +384,12 @@ func (s FolderSynchronizer) reconcileFolder(
 	batchSize int,
 ) error {
 	uids, err := session.SearchUIDs(ctx, connectors.SearchRequest{Limit: maximumInitialUIDs})
+	if errors.Is(err, connectors.ErrSearchOverflow) {
+		// Reconciling against a truncated snapshot would read as mass
+		// deletion; skipping the pass is the only safe degradation for a
+		// folder beyond the enumeration limit.
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("search all folder messages: %w", err)
 	}

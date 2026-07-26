@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"time"
 
-	"mailmanager/internal/connectors"
 	"mailmanager/internal/events"
 	"mailmanager/internal/repository"
 	mailSync "mailmanager/internal/sync"
@@ -114,6 +113,15 @@ func (r *Runtime) dropPendingSync(job syncJob) {
 	r.syncMu.Lock()
 	delete(r.pending, job.key())
 	r.syncMu.Unlock()
+}
+
+// jobFailures reports how many consecutive attempts of this job have failed;
+// retries use it to permit degraded body storage so one transient failure
+// gets a clean retry before a poison message is stored bodyless.
+func (r *Runtime) jobFailures(job syncJob) int {
+	r.syncMu.Lock()
+	defer r.syncMu.Unlock()
+	return r.failures[job.key()]
 }
 
 func (r *Runtime) syncWorker(ctx context.Context) {
@@ -263,8 +271,15 @@ func (r *Runtime) runSyncJob(ctx context.Context, job syncJob) error {
 		} else if errors.Is(err, errOAuthRefresh) {
 			status, code = "reauth_required", "oauth_refresh_failed"
 		}
-		_ = r.repository.UpdateAccountStatus(ctx, job.accountID, status, code)
-		r.events.Publish(events.Event{Type: "account.status", ResourceID: job.accountID, State: status})
+		// A failing background reconcile or backfill must not flip the whole
+		// account into an error state while new mail keeps arriving; the
+		// folder-level error marker and log carry the detail. Credential
+		// problems always surface.
+		background := job.kind == syncBackfill || job.kind == syncReconcile
+		if !background || status != "error" {
+			_ = r.repository.UpdateAccountStatus(ctx, job.accountID, status, code)
+			r.events.Publish(events.Event{Type: "account.status", ResourceID: job.accountID, State: status})
+		}
 		r.logger.Warn("mail sync job failed", "account_id", job.accountID, "folder_id", job.folderID, "kind", job.kind, "error", err)
 		return err
 	}
@@ -325,23 +340,20 @@ func (r *Runtime) syncFolder(ctx context.Context, job syncJob) (err error) {
 	if err != nil {
 		return err
 	}
-	var session connectors.IMAPSession
+	// Foreground and background jobs draw from separate per-account pool
+	// slots: reconciles must not hold the new-mail session, but a reconcile
+	// burst over many folders should still cost one login, not one each —
+	// 163/QQ throttle exactly that pattern.
+	poolKey := job.accountID
 	if job.kind == syncReconcile {
-		// Reconciles are long; a dedicated connection keeps the pooled
-		// foreground session free for new-mail syncs.
-		session, err = r.imapDialer.Dial(ctx, config)
-		if err != nil {
-			return fmt.Errorf("dial IMAP for folder sync: %w", err)
-		}
-		defer session.Close()
-	} else {
-		pooled, acquireErr := r.acquireSession(ctx, job.accountID, config)
-		if acquireErr != nil {
-			return fmt.Errorf("dial IMAP for folder sync: %w", acquireErr)
-		}
-		defer func() { r.releaseSession(job.accountID, pooled, err == nil) }()
-		session = pooled.session
+		poolKey = backgroundPoolKey(job.accountID)
 	}
+	pooled, acquireErr := r.acquireSession(ctx, poolKey, config)
+	if acquireErr != nil {
+		return fmt.Errorf("dial IMAP for folder sync: %w", acquireErr)
+	}
+	defer func() { r.releaseSession(poolKey, pooled, err == nil) }()
+	session := pooled.session
 	checkpoint, err := r.ingest.Checkpoint(ctx, job.accountID, job.folderID)
 	if err != nil {
 		return err
@@ -353,6 +365,7 @@ func (r *Runtime) syncFolder(ctx context.Context, job syncJob) (err error) {
 	request := mailSync.FolderSyncRequest{
 		AccountID: job.accountID, FolderID: job.folderID, Mailbox: job.mailbox, Provider: config.Provider,
 		Checkpoint: checkpoint, PendingOperationIDs: pending, Now: time.Now().UTC(),
+		AllowDegradedBodies: r.jobFailures(job) > 0,
 	}
 	if job.kind == syncReconcile {
 		_, err = r.synchronizer.Sync(ctx, session, r.ingest, request)
@@ -375,16 +388,18 @@ func (r *Runtime) syncFolder(ctx context.Context, job syncJob) (err error) {
 	return nil
 }
 
-func (r *Runtime) backfillFolder(ctx context.Context, job syncJob) error {
+func (r *Runtime) backfillFolder(ctx context.Context, job syncJob) (err error) {
 	config, err := r.accountConfig(ctx, job.accountID)
 	if err != nil {
 		return err
 	}
-	session, err := r.imapDialer.Dial(ctx, config)
-	if err != nil {
-		return fmt.Errorf("dial IMAP for history backfill: %w", err)
+	poolKey := backgroundPoolKey(job.accountID)
+	pooled, acquireErr := r.acquireSession(ctx, poolKey, config)
+	if acquireErr != nil {
+		return fmt.Errorf("dial IMAP for history backfill: %w", acquireErr)
 	}
-	defer session.Close()
+	defer func() { r.releaseSession(poolKey, pooled, err == nil) }()
+	session := pooled.session
 	checkpoint, err := r.ingest.Checkpoint(ctx, job.accountID, job.folderID)
 	if err != nil {
 		return err
@@ -399,6 +414,7 @@ func (r *Runtime) backfillFolder(ctx context.Context, job syncJob) error {
 	request := mailSync.FolderSyncRequest{
 		AccountID: job.accountID, FolderID: job.folderID, Mailbox: job.mailbox, Provider: config.Provider,
 		Checkpoint: checkpoint, PendingOperationIDs: pending, Now: time.Now().UTC(),
+		AllowDegradedBodies: r.jobFailures(job) > 0,
 	}
 	if err := r.synchronizer.BackfillHistory(ctx, session, r.ingest, request); err != nil {
 		_ = r.ingest.MarkFolderError(ctx, job.accountID, job.folderID, "backfill_failed")
