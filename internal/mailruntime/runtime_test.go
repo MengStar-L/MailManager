@@ -544,17 +544,29 @@ func TestSyncJobsForSameAccountAreSerialized(t *testing.T) {
 	gate := make(chan struct{})
 	dialer := &blockingIMAPDialer{gate: gate, started: make(chan struct{}, 4)}
 	fixture.runtime.imapDialer = dialer
-	done := make(chan error, len(folders))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := fixture.runtime.Start(ctx); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	defer func() {
+		cancel()
+		fixture.runtime.Close()
+	}()
 	for _, folder := range folders {
-		job := syncJob{accountID: account.ID, folderID: folder.ID, mailbox: folder.RemoteName, kind: syncFolder}
-		go func() { done <- fixture.runtime.runSyncJob(context.Background(), job) }()
+		if err := fixture.runtime.enqueueSync(ctx, syncJob{
+			accountID: account.ID, folderID: folder.ID, mailbox: folder.RemoteName, kind: syncFolder,
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	select {
 	case <-dialer.started:
-	case <-time.After(time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("first same-account sync did not start")
 	}
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 	dialer.mu.Lock()
 	peak := dialer.peak
 	dialer.mu.Unlock()
@@ -563,9 +575,22 @@ func TestSyncJobsForSameAccountAreSerialized(t *testing.T) {
 		t.Fatalf("same-account peak connections = %d, want 1", peak)
 	}
 	close(gate)
-	for range folders {
-		if err := <-done; err != nil {
-			t.Fatal(err)
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		fixture.runtime.syncMu.Lock()
+		pending := len(fixture.runtime.pending)
+		waiting := len(fixture.runtime.fgWaiting)
+		fixture.runtime.syncMu.Unlock()
+		if pending == 0 && waiting == 0 {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("parked same-account jobs never completed: pending=%d waiting=%d", pending, waiting)
+		case <-ticker.C:
 		}
 	}
 }

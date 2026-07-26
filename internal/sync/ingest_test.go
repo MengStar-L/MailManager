@@ -102,6 +102,16 @@ type fakeIngestSink struct {
 	storedMessages  []connectors.RemoteMessage
 	reconciliations []FolderSnapshot
 	checkpoint      Checkpoint
+	healUIDs        []uint32
+	healRequests    int
+}
+
+func (s *fakeIngestSink) EnvelopeHealCandidates(_ context.Context, _, _ string, _ uint32, limit int) ([]uint32, error) {
+	s.healRequests++
+	if len(s.healUIDs) > limit {
+		return append([]uint32(nil), s.healUIDs[:limit]...), nil
+	}
+	return append([]uint32(nil), s.healUIDs...), nil
 }
 
 func (s *fakeIngestSink) PrepareFolder(_ context.Context, decision ReconcileDecision) error {
@@ -271,7 +281,7 @@ func TestFolderSynchronizerIncrementalSkipsFullReconciliation(t *testing.T) {
 	}
 }
 
-func TestFolderSynchronizerRefreshesBodiesByExplicitUID(t *testing.T) {
+func TestFolderSynchronizerHealsDamagedEnvelopesInBoundedBatches(t *testing.T) {
 	const lastUID = uint32(1_767_690_355)
 	checkpoint := Checkpoint{
 		AccountID: "account", FolderID: "folder", UIDValidity: 4,
@@ -281,33 +291,62 @@ func TestFolderSynchronizerRefreshesBodiesByExplicitUID(t *testing.T) {
 		state:   connectors.MailboxState{UIDValidity: 4, UIDNext: lastUID + 1},
 		allUIDs: []uint32{7, lastUID},
 		messages: map[uint32]connectors.RemoteMessage{
-			7:       {TextBody: "old"},
-			lastUID: {TextBody: "new"},
+			7:       {TextBody: "healed-old"},
+			lastUID: {TextBody: "healed-new"},
 		},
 	}
-	sink := &fakeIngestSink{}
-	next, err := (FolderSynchronizer{BatchSize: 1}).Sync(context.Background(), session, sink, FolderSyncRequest{
+	sink := &fakeIngestSink{healUIDs: []uint32{lastUID, 7}}
+	next, err := (FolderSynchronizer{BatchSize: 1}).SyncIncremental(context.Background(), session, sink, FolderSyncRequest{
 		AccountID: "account", FolderID: "folder", Mailbox: "INBOX",
 		Checkpoint: checkpoint, Now: time.Now().UTC(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(session.fetchRequests) != 2 {
-		t.Fatalf("body refresh requests = %#v", session.fetchRequests)
-	}
-	for _, request := range session.fetchRequests {
-		if len(request.UIDs) != 1 || request.FromUID != 0 || request.ThroughUID != 0 {
-			t.Fatalf("body refresh used a UID range: %#v", request)
-		}
+	if sink.healRequests != 1 || len(session.fetchRequests) < 2 {
+		t.Fatalf("heal pass did not fetch candidates: heals=%d fetches=%#v", sink.healRequests, session.fetchRequests)
 	}
 	for _, batch := range sink.batches {
 		if !batch.RefreshBody {
-			t.Fatalf("body refresh batch was not marked: %#v", batch)
+			t.Fatalf("heal batch was not marked for refresh: %#v", batch)
 		}
 	}
 	if next.BodyRefreshRequired || sink.checkpoint.BodyRefreshRequired {
-		t.Fatalf("body refresh flag was not cleared after success: next=%#v stored=%#v", next, sink.checkpoint)
+		t.Fatalf("heal flag was not cleared after draining candidates: next=%#v stored=%#v", next, sink.checkpoint)
+	}
+	if next.LastUID != lastUID {
+		t.Fatalf("heal pass moved the checkpoint: %#v", next)
+	}
+}
+
+func TestFolderSynchronizerKeepsHealFlagWhileCandidatesRemain(t *testing.T) {
+	checkpoint := Checkpoint{
+		AccountID: "account", FolderID: "folder", UIDValidity: 4,
+		UIDNext: 1000, LastUID: 999, BodyRefreshRequired: true,
+	}
+	uids := make([]uint32, envelopeHealLimit+5)
+	messages := map[uint32]connectors.RemoteMessage{}
+	for index := range uids {
+		uids[index] = uint32(index + 1)
+		messages[uint32(index+1)] = connectors.RemoteMessage{TextBody: "x"}
+	}
+	session := &fakeIngestSession{
+		state:    connectors.MailboxState{UIDValidity: 4, UIDNext: 1000},
+		messages: messages,
+	}
+	sink := &fakeIngestSink{healUIDs: uids}
+	next, err := (FolderSynchronizer{BatchSize: 100}).SyncIncremental(context.Background(), session, sink, FolderSyncRequest{
+		AccountID: "account", FolderID: "folder", Mailbox: "INBOX",
+		Checkpoint: checkpoint, Now: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !next.BodyRefreshRequired {
+		t.Fatal("a full candidate batch must keep the heal flag for the next sync")
+	}
+	if len(sink.storedMessages) != envelopeHealLimit {
+		t.Fatalf("heal pass stored %d messages, want the %d-message cap", len(sink.storedMessages), envelopeHealLimit)
 	}
 }
 
@@ -413,7 +452,7 @@ func TestFolderSynchronizerFailsWhenEveryBodyFetchFails(t *testing.T) {
 	}
 }
 
-func TestFolderSynchronizerDegradedRefreshDoesNotOverwriteStoredBodies(t *testing.T) {
+func TestFolderSynchronizerDegradedHealDoesNotOverwriteStoredBodies(t *testing.T) {
 	parts := []connectors.RemotePart{{Path: []int{1}, MediaType: "text/plain", Size: 10}}
 	checkpoint := Checkpoint{
 		AccountID: "account", FolderID: "folder", UIDValidity: 4,
@@ -421,20 +460,21 @@ func TestFolderSynchronizerDegradedRefreshDoesNotOverwriteStoredBodies(t *testin
 	}
 	session := &fakeIngestSession{
 		state:        connectors.MailboxState{UIDValidity: 4, UIDNext: 21},
-		allUIDs:      []uint32{19, 20},
 		messages:     map[uint32]connectors.RemoteMessage{19: {Parts: parts}, 20: {Parts: parts}},
 		partBodies:   map[int][]byte{1: []byte("fresh body")},
 		partFailures: map[uint32]error{20: errors.New("transient NO")},
 	}
-	sink := &fakeIngestSink{}
-	if _, err := (FolderSynchronizer{BatchSize: 10}).Sync(context.Background(), session, sink, FolderSyncRequest{
+	sink := &fakeIngestSink{healUIDs: []uint32{19, 20}}
+	// The heal pass always tolerates degraded bodies, even on a first
+	// attempt: a poison message must not wedge the heal loop.
+	if _, err := (FolderSynchronizer{BatchSize: 10}).SyncIncremental(context.Background(), session, sink, FolderSyncRequest{
 		AccountID: "account", FolderID: "folder", Mailbox: "INBOX",
-		Checkpoint: checkpoint, Now: time.Now().UTC(), AllowDegradedBodies: true,
+		Checkpoint: checkpoint, Now: time.Now().UTC(),
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if len(sink.batches) != 2 {
-		t.Fatalf("stored %d messages during refresh, want 2", len(sink.batches))
+		t.Fatalf("healed %d messages, want 2", len(sink.batches))
 	}
 	if !sink.batches[0].RefreshBody {
 		t.Fatal("healthy message lost its refresh semantics")

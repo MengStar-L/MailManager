@@ -143,6 +143,35 @@ func (s *Store) Checkpoint(ctx context.Context, accountID, folderID string) (mai
 	return checkpoint, nil
 }
 
+// EnvelopeHealCandidates lists messages a damaged sync stored with an empty
+// envelope so the refresh pass can re-derive their metadata in bounded
+// batches. A real message always carries a sender, so the marker cannot
+// match legitimate mail.
+func (s *Store) EnvelopeHealCandidates(ctx context.Context, accountID, folderID string, uidValidity uint32, limit int) ([]uint32, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	rows, err := s.database.DB().QueryContext(ctx, `
+		SELECT ml.uid FROM message_locations ml
+		JOIN messages m ON m.id = ml.message_id
+		WHERE ml.account_id = ? AND ml.folder_id = ? AND ml.uid_validity = ?
+		  AND m.subject = '' AND m.from_json = '[]'
+		ORDER BY ml.uid DESC LIMIT ?`, accountID, folderID, uidValidity, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var uids []uint32
+	for rows.Next() {
+		var uid uint32
+		if err := rows.Scan(&uid); err != nil {
+			return nil, err
+		}
+		uids = append(uids, uid)
+	}
+	return uids, rows.Err()
+}
+
 func (s *Store) PendingOperationIDs(ctx context.Context, accountID string) ([]string, error) {
 	rows, err := s.database.DB().QueryContext(ctx, `SELECT id FROM operations WHERE account_id = ? AND status IN ('queued','running')`, accountID)
 	if err != nil {

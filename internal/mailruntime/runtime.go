@@ -85,9 +85,10 @@ type Runtime struct {
 	syncMu   sync.Mutex
 	pending  map[string]*syncJobState
 	failures map[string]int
-	// bgWaiting parks background jobs whose per-account slot is taken; the
+	// fgWaiting/bgWaiting park jobs whose per-account slot is taken; the
 	// slot holder re-dispatches the next one on release, so contended jobs
-	// chain instead of colliding on retry timers.
+	// chain instead of blocking workers or colliding on retry timers.
+	fgWaiting map[string][]syncJob
 	bgWaiting map[string][]syncJob
 
 	operationWake chan struct{}
@@ -181,7 +182,7 @@ func New(options Options) (*Runtime, error) {
 		cacheQuotaBytes:    options.AttachmentCacheQuotaBytes,
 		syncHigh:           make(chan syncJob, 256), syncLow: make(chan syncJob, 256),
 		pending: make(map[string]*syncJobState), failures: make(map[string]int),
-		bgWaiting: make(map[string][]syncJob),
+		fgWaiting: make(map[string][]syncJob), bgWaiting: make(map[string][]syncJob),
 		operationWake: make(chan struct{}, 1), outboxWake: make(chan struct{}, 1),
 		idleWatchers: make(map[string]idleWatcher), sessions: make(map[string]*pooledSession),
 		pollInterval: mailSync.InboxPollInterval, reconcileInterval: mailSync.FolderReconcileInterval,

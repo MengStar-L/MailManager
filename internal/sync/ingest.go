@@ -72,6 +72,19 @@ type IngestSink interface {
 	CompleteFolder(context.Context, Checkpoint) error
 }
 
+// RefreshCandidateSource reports stored messages whose metadata needs to be
+// re-derived from the server (an earlier sync stored them with an empty
+// envelope). Implemented by the ingest store; the refresh pass heals a
+// bounded batch per sync instead of re-downloading whole folders.
+type RefreshCandidateSource interface {
+	EnvelopeHealCandidates(ctx context.Context, accountID, folderID string, uidValidity uint32, limit int) ([]uint32, error)
+}
+
+// envelopeHealLimit bounds how many damaged messages one sync re-fetches so
+// a heal pass can never turn into a folder-length monolith that blocks new
+// mail behind it.
+const envelopeHealLimit = 200
+
 type FolderSynchronizer struct {
 	BatchSize        int
 	MaxBodyPartBytes int64
@@ -126,27 +139,7 @@ func (s FolderSynchronizer) sync(ctx context.Context, session IngestSession, sin
 
 	incrementalProbe := false
 	var highestFetched uint32
-	bodyRefresh := request.Checkpoint.BodyRefreshRequired
-	var refreshUIDs []uint32
-	if bodyRefresh {
-		uids, err := session.SearchUIDs(ctx, connectors.SearchRequest{Limit: maximumInitialUIDs})
-		if errors.Is(err, connectors.ErrSearchOverflow) {
-			// A folder too large to enumerate keeps its stored bodies; new
-			// mail still syncs through the incremental path below, keeping
-			// checkpoint advancement tied to actually fetched UIDs.
-			bodyRefresh = false
-		} else if err != nil {
-			return Checkpoint{}, fmt.Errorf("search messages for body refresh: %w", err)
-		} else {
-			refreshUIDs = uids
-		}
-	}
-	if bodyRefresh {
-		highestFetched = maxUID(refreshUIDs)
-		if err := s.fetchExplicitBatches(ctx, session, sink, request, state.UIDValidity, refreshUIDs, batchSize, false, true); err != nil {
-			return Checkpoint{}, err
-		}
-	} else if decision.Action == ReconcileInitialize || decision.Action == ReconcileRebuild {
+	if decision.Action == ReconcileInitialize || decision.Action == ReconcileRebuild {
 		passes := InitialSyncPasses(request.Now)
 		uids, err := session.SearchUIDs(ctx, connectors.SearchRequest{Since: passes[0].Since, Limit: maximumInitialUIDs})
 		if err != nil {
@@ -177,6 +170,29 @@ func (s FolderSynchronizer) sync(ctx context.Context, session IngestSession, sin
 			return Checkpoint{}, err
 		}
 	}
+	// New mail is already stored; now heal a bounded batch of messages an
+	// earlier sync stored with an empty envelope. Always best-effort: a
+	// message whose header cannot be fetched must not fail the folder.
+	refreshRemaining := false
+	if request.Checkpoint.BodyRefreshRequired {
+		if source, ok := sink.(RefreshCandidateSource); ok {
+			candidates, err := source.EnvelopeHealCandidates(ctx, request.AccountID, request.FolderID, state.UIDValidity, envelopeHealLimit)
+			if err != nil {
+				return Checkpoint{}, fmt.Errorf("list envelope heal candidates: %w", err)
+			}
+			if len(candidates) > 0 {
+				healRequest := request
+				healRequest.AllowDegradedBodies = true
+				if err := s.fetchExplicitBatches(ctx, session, sink, healRequest, state.UIDValidity, candidates, batchSize, false, true); err != nil {
+					return Checkpoint{}, err
+				}
+			}
+			// A full batch may mean more remain; keep the flag for the next
+			// sync. Anything below the limit was healed in this pass.
+			refreshRemaining = len(candidates) == envelopeHealLimit
+		}
+	}
+
 	if reconcile {
 		if err := s.reconcileFolder(ctx, session, sink, request, state, batchSize); err != nil {
 			return Checkpoint{}, err
@@ -184,7 +200,7 @@ func (s FolderSynchronizer) sync(ctx context.Context, session IngestSession, sin
 	}
 
 	next := decision.Checkpoint
-	next.BodyRefreshRequired = false
+	next.BodyRefreshRequired = refreshRemaining
 	if incrementalProbe {
 		// Advance only over UIDs that were actually stored so a message the
 		// server exposes late is fetched by a later probe instead of being

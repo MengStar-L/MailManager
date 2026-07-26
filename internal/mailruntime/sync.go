@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"mailmanager/internal/events"
@@ -11,10 +12,10 @@ import (
 	mailSync "mailmanager/internal/sync"
 )
 
-// errSyncBusy marks a background job that found its per-account slot taken
-// and parked itself in bgWaiting; it is not a failure, and the slot holder
-// re-dispatches it on release.
-var errSyncBusy = errors.New("account background sync slot is busy")
+// errSyncBusy marks a job that found its per-account slot taken and parked
+// itself in the tier's waiting queue; it is not a failure, and the slot
+// holder re-dispatches it on release.
+var errSyncBusy = errors.New("account sync slot is busy")
 
 func (job syncJob) key() string {
 	switch job.kind {
@@ -154,7 +155,7 @@ func (r *Runtime) nextSyncJob(ctx context.Context) (syncJob, bool) {
 func (r *Runtime) finishSyncJob(ctx context.Context, job syncJob, runErr error) {
 	if errors.Is(runErr, errSyncBusy) {
 		// The job stays pending while parked so deduplication keeps working;
-		// releaseBackgroundSlot dispatches it again.
+		// releaseSyncSlot dispatches it again.
 		return
 	}
 	key := job.key()
@@ -193,32 +194,33 @@ func (r *Runtime) finishSyncJob(ctx context.Context, job syncJob, runErr error) 
 	}()
 }
 
-// acquireBackgroundSlot claims the account's background slot or parks the job
-// until the current holder releases it. Parking under syncMu makes the
-// TryLock-or-park decision atomic with respect to releaseBackgroundSlot.
-func (r *Runtime) acquireBackgroundSlot(job syncJob) bool {
-	lock := r.syncBackgroundLock(job.accountID)
+// acquireSyncSlot claims the account's slot in the given tier or parks the
+// job until the current holder releases it. Parking under syncMu makes the
+// TryLock-or-park decision atomic with respect to releaseSyncSlot. Workers
+// never block on account locks: a long job (e.g. a large folder heal) must
+// not be able to starve the pool through its queued siblings.
+func (r *Runtime) acquireSyncSlot(lock *sync.Mutex, waiting map[string][]syncJob, job syncJob) bool {
 	r.syncMu.Lock()
 	defer r.syncMu.Unlock()
 	if lock.TryLock() {
 		return true
 	}
-	r.bgWaiting[job.accountID] = append(r.bgWaiting[job.accountID], job)
+	waiting[job.accountID] = append(waiting[job.accountID], job)
 	return false
 }
 
-func (r *Runtime) releaseBackgroundSlot(ctx context.Context, accountID string) {
-	r.syncBackgroundLock(accountID).Unlock()
+func (r *Runtime) releaseSyncSlot(ctx context.Context, lock *sync.Mutex, waiting map[string][]syncJob, accountID string) {
+	lock.Unlock()
 	r.syncMu.Lock()
-	waiting := r.bgWaiting[accountID]
+	queue := waiting[accountID]
 	var next *syncJob
-	if len(waiting) > 0 {
-		job := waiting[0]
+	if len(queue) > 0 {
+		job := queue[0]
 		next = &job
-		if len(waiting) == 1 {
-			delete(r.bgWaiting, accountID)
+		if len(queue) == 1 {
+			delete(waiting, accountID)
 		} else {
-			r.bgWaiting[accountID] = waiting[1:]
+			waiting[accountID] = queue[1:]
 		}
 	}
 	r.syncMu.Unlock()
@@ -237,14 +239,17 @@ func (r *Runtime) releaseBackgroundSlot(ctx context.Context, accountID string) {
 func (r *Runtime) runSyncJob(ctx context.Context, job syncJob) error {
 	switch job.kind {
 	case syncBackfill, syncReconcile:
-		if !r.acquireBackgroundSlot(job) {
+		lock := r.syncBackgroundLock(job.accountID)
+		if !r.acquireSyncSlot(lock, r.bgWaiting, job) {
 			return errSyncBusy
 		}
-		defer r.releaseBackgroundSlot(ctx, job.accountID)
+		defer r.releaseSyncSlot(ctx, lock, r.bgWaiting, job.accountID)
 	default:
 		lock := r.syncForegroundLock(job.accountID)
-		lock.Lock()
-		defer lock.Unlock()
+		if !r.acquireSyncSlot(lock, r.fgWaiting, job) {
+			return errSyncBusy
+		}
+		defer r.releaseSyncSlot(ctx, lock, r.fgWaiting, job.accountID)
 	}
 
 	jobCtx, cancel := context.WithTimeout(ctx, timeoutForSyncJob(job.kind))
