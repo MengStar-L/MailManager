@@ -28,6 +28,20 @@ func (s *fakeIngestSession) Select(context.Context, string, bool) (connectors.Ma
 
 func (s *fakeIngestSession) SearchUIDs(_ context.Context, request connectors.SearchRequest) ([]uint32, error) {
 	s.searchRequests = append(s.searchRequests, request)
+	if request.FromUID != 0 {
+		result := make([]uint32, 0, len(s.allUIDs))
+		for _, uid := range s.allUIDs {
+			if uid >= request.FromUID {
+				result = append(result, uid)
+			}
+		}
+		// Servers answer n:* with the highest existing UID even when n
+		// exceeds it.
+		if len(result) == 0 && len(s.allUIDs) > 0 {
+			result = append(result, s.allUIDs[len(s.allUIDs)-1])
+		}
+		return result, nil
+	}
 	if request.Since.IsZero() && request.Before.IsZero() {
 		return append([]uint32(nil), s.allUIDs...), nil
 	}
@@ -204,7 +218,8 @@ func TestFolderSynchronizerIncrementalAndUIDValidityChange(t *testing.T) {
 	if _, err := (FolderSynchronizer{BatchSize: 10}).Sync(context.Background(), session, sink, request); err != nil {
 		t.Fatal(err)
 	}
-	if len(session.fetchRequests) != 1 || session.fetchRequests[0].FromUID != 19 || session.fetchRequests[0].ThroughUID != 20 {
+	if len(session.fetchRequests) != 1 || len(session.fetchRequests[0].UIDs) != 2 ||
+		session.fetchRequests[0].UIDs[0] != 19 || session.fetchRequests[0].UIDs[1] != 20 {
 		t.Fatalf("unexpected incremental request: %#v", session.fetchRequests)
 	}
 
@@ -224,6 +239,7 @@ func TestFolderSynchronizerIncrementalSkipsFullReconciliation(t *testing.T) {
 	checkpoint := Checkpoint{AccountID: "account", FolderID: "folder", UIDValidity: 4, UIDNext: 19, LastUID: 18}
 	session := &fakeIngestSession{
 		state:    connectors.MailboxState{UIDValidity: 4, UIDNext: 20},
+		allUIDs:  []uint32{19},
 		messages: map[uint32]connectors.RemoteMessage{19: {UID: 19, TextBody: "new"}},
 	}
 	sink := &fakeIngestSink{}
@@ -238,7 +254,10 @@ func TestFolderSynchronizerIncrementalSkipsFullReconciliation(t *testing.T) {
 	if next.LastUID != 19 || len(sink.storedMessages) != 1 {
 		t.Fatalf("incremental result = %#v, stored = %d", next, len(sink.storedMessages))
 	}
-	if len(session.searchRequests) != 0 || len(session.stateRequests) != 0 || len(sink.reconciliations) != 0 {
+	if len(session.searchRequests) != 1 || session.searchRequests[0].FromUID != 19 {
+		t.Fatalf("incremental sync did not probe for new UIDs: %#v", session.searchRequests)
+	}
+	if len(session.stateRequests) != 0 || len(sink.reconciliations) != 0 {
 		t.Fatal("fast sync performed full folder reconciliation")
 	}
 }

@@ -97,28 +97,87 @@ function useDebouncedValue<T>(value: T, delay: number): T {
   return debounced;
 }
 
-function useLiveEvents() {
+const eventsReconnectMinMs = 5_000;
+const eventsReconnectMaxMs = 30_000;
+// The backend publishes a sync event for every account at least once per poll
+// cycle, so a stream silent for this long is dead even if the browser still
+// reports it open (e.g. a connection dropped without a reset).
+const eventsStaleMs = 180_000;
+
+function useLiveEvents(): boolean {
   const queryClient = useQueryClient();
+  const [healthy, setHealthy] = useState(true);
   useEffect(() => {
     if (demoMode || typeof EventSource === "undefined") return;
-    const events = new EventSource("/api/v1/events", { withCredentials: true });
-    events.onmessage = (event) => {
-      try {
-        const payload = JSON.parse(event.data) as { type?: string };
-        const type = payload.type ?? "";
-        if (type === "resync_required") queryClient.invalidateQueries();
-        else if (type.startsWith("account.") || type.startsWith("sync.")) {
-          queryClient.invalidateQueries({ queryKey: ["accounts"] });
-          queryClient.invalidateQueries({ queryKey: ["mailboxes"] });
-          queryClient.invalidateQueries({ queryKey: ["conversations"] });
-        } else if (type.startsWith("draft.") || type.startsWith("outbox.")) {
-          queryClient.invalidateQueries({ queryKey: ["drafts"] });
-          if (type.startsWith("outbox.")) queryClient.invalidateQueries({ queryKey: ["conversations"] });
-        } else queryClient.invalidateQueries({ queryKey: ["conversations"] });
-      } catch { /* Ignore keep-alive or unknown event payloads. */ }
+    let events: EventSource | undefined;
+    let reconnectTimer: number | undefined;
+    let staleTimer: number | undefined;
+    let reconnectDelay = eventsReconnectMinMs;
+    let rebuilt = false;
+    let disposed = false;
+
+    const armStaleTimer = () => {
+      if (staleTimer !== undefined) window.clearTimeout(staleTimer);
+      staleTimer = window.setTimeout(() => { setHealthy(false); restart(); }, eventsStaleMs);
     };
-    return () => events.close();
+    const restart = () => {
+      if (disposed) return;
+      events?.close();
+      if (staleTimer !== undefined) { window.clearTimeout(staleTimer); staleTimer = undefined; }
+      if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
+      rebuilt = true;
+      reconnectTimer = window.setTimeout(connect, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, eventsReconnectMaxMs);
+    };
+    const connect = () => {
+      if (disposed) return;
+      events = new EventSource("/api/v1/events", { withCredentials: true });
+      // Keep the watchdog armed through CONNECTING so a proxy that accepts
+      // the connection but never responds still gets torn down and retried.
+      armStaleTimer();
+      events.onopen = () => {
+        reconnectDelay = eventsReconnectMinMs;
+        setHealthy(true);
+        // Only a rebuilt EventSource loses its Last-Event-ID; the browser's
+        // own reconnects resume via hub replay or resync_required.
+        if (rebuilt) queryClient.invalidateQueries();
+        rebuilt = false;
+        armStaleTimer();
+      };
+      events.onmessage = (event) => {
+        armStaleTimer();
+        try {
+          const payload = JSON.parse(event.data) as { type?: string };
+          const type = payload.type ?? "";
+          if (type === "heartbeat") return;
+          if (type === "resync_required") queryClient.invalidateQueries();
+          else if (type.startsWith("account.") || type.startsWith("sync.")) {
+            queryClient.invalidateQueries({ queryKey: ["accounts"] });
+            queryClient.invalidateQueries({ queryKey: ["mailboxes"] });
+            queryClient.invalidateQueries({ queryKey: ["conversations"] });
+          } else if (type.startsWith("draft.") || type.startsWith("outbox.")) {
+            queryClient.invalidateQueries({ queryKey: ["drafts"] });
+            if (type.startsWith("outbox.")) queryClient.invalidateQueries({ queryKey: ["conversations"] });
+          } else queryClient.invalidateQueries({ queryKey: ["conversations"] });
+        } catch { /* Ignore keep-alive or unknown event payloads. */ }
+      };
+      events.onerror = () => {
+        setHealthy(false);
+        // The browser retries transient drops itself; a CLOSED stream (non-200
+        // response, proxy restart) stays dead until rebuilt here.
+        if (events?.readyState === EventSource.CLOSED) restart();
+      };
+    };
+
+    connect();
+    return () => {
+      disposed = true;
+      if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
+      if (staleTimer !== undefined) window.clearTimeout(staleTimer);
+      events?.close();
+    };
   }, [queryClient]);
+  return healthy;
 }
 
 export default function App() {
@@ -146,7 +205,7 @@ export default function App() {
   const composerTransitionRef = useRef(false);
   const recoverySyncRef = useRef(false);
 
-  useLiveEvents();
+  const eventsHealthy = useLiveEvents();
   const accountsQuery = useQuery({ queryKey: ["accounts"], queryFn: api.getAccounts });
   const mailboxesQuery = useQuery({ queryKey: ["mailboxes"], queryFn: api.getMailboxes });
   const statusQuery = useQuery({ queryKey: ["system-status"], queryFn: api.getSystemStatus, refetchInterval: 30_000 });
@@ -166,6 +225,10 @@ export default function App() {
     getNextPageParam: (lastPage) => lastPage.next_cursor,
     enabled: role !== "drafts",
     placeholderData: keepPreviousData,
+    // The event stream is the primary refresh signal; poll only while it is
+    // down so new mail cannot sit invisible in the database.
+    refetchInterval: eventsHealthy ? false : 30_000,
+    refetchOnWindowFocus: true,
   });
 
   const accounts = accountsQuery.data?.items ?? [];

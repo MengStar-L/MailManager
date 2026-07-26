@@ -136,7 +136,9 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			flusher.Flush()
 		case <-keepAlive.C:
-			if _, err := fmt.Fprint(w, ": keep-alive\n\n"); err != nil {
+			// A real event rather than a comment so browser clients can
+			// detect a silently dead stream by message staleness.
+			if err := writeEvent(w, Event{Type: "heartbeat"}); err != nil {
 				return
 			}
 			flusher.Flush()

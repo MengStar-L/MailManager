@@ -15,10 +15,15 @@ class ResizeObserverMock {
 }
 
 class EventSourceMock {
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSED = 2;
+  onopen: ((event: Event) => void) | null = null;
   onmessage: ((event: MessageEvent) => void) | null = null;
   onerror: ((event: Event) => void) | null = null;
+  readyState = EventSourceMock.CONNECTING;
   constructor(public readonly url: string | URL) {}
-  close() {}
+  close() { this.readyState = EventSourceMock.CLOSED; }
 }
 
 Object.defineProperty(window, "ResizeObserver", { writable: true, value: ResizeObserverMock });

@@ -137,6 +137,8 @@ func (s *fakeIMAPSession) ListMailboxes(context.Context) ([]connectors.RemoteMai
 	return append([]connectors.RemoteMailbox(nil), s.mailboxes...), nil
 }
 
+func (s *fakeIMAPSession) Noop(context.Context) error { return nil }
+
 func (s *fakeIMAPSession) Select(_ context.Context, name string, _ bool) (connectors.MailboxState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -408,18 +410,28 @@ func TestSyncQueueDeduplicatesAndWorkersStayWithinLimit(t *testing.T) {
 	cancel()
 }
 
-func TestSyncQueuePreservesReconciliationRequest(t *testing.T) {
+func TestSyncQueueTracksReconcileAndIncrementalIndependently(t *testing.T) {
 	fixture := newRuntimeFixture(t)
-	full := syncJob{accountID: "account", folderID: "folder", mailbox: "INBOX", kind: syncFolder, reconcile: true}
+	full := syncJob{accountID: "account", folderID: "folder", mailbox: "INBOX", kind: syncReconcile}
 	fast := syncJob{accountID: "account", folderID: "folder", mailbox: "INBOX", kind: syncFolder}
+	if full.key() == fast.key() {
+		t.Fatal("reconcile and incremental jobs must not share a dedup key")
+	}
 	if err := fixture.runtime.enqueueSync(context.Background(), full); err != nil {
 		t.Fatal(err)
 	}
 	if err := fixture.runtime.enqueueSync(context.Background(), fast); err != nil {
 		t.Fatal(err)
 	}
-	if !fixture.runtime.pending[full.key()].job.reconcile {
-		t.Fatal("fast rerun downgraded a pending full reconciliation")
+	if fixture.runtime.pending[full.key()].job.kind != syncReconcile {
+		t.Fatal("pending reconcile job was lost")
+	}
+	if fixture.runtime.pending[fast.key()].job.kind != syncFolder {
+		t.Fatal("pending incremental job was lost")
+	}
+	if len(fixture.runtime.syncLow) != 1 || len(fixture.runtime.syncHigh) != 1 {
+		t.Fatalf("reconcile must queue at low priority: high=%d low=%d",
+			len(fixture.runtime.syncHigh), len(fixture.runtime.syncLow))
 	}
 }
 
@@ -436,15 +448,15 @@ func TestFolderReconciliationSchedulesInboxAndOtherFolders(t *testing.T) {
 
 	fixture.runtime.scheduleFolderReconciliation(context.Background())
 	queued := make(map[string]syncJob)
-	for len(fixture.runtime.syncHigh) > 0 {
-		job := <-fixture.runtime.syncHigh
+	for len(fixture.runtime.syncLow) > 0 {
+		job := <-fixture.runtime.syncLow
 		queued[job.folderID] = job
 	}
 	if len(queued) != len(folders) {
 		t.Fatalf("reconciliation queued %d folders, want %d", len(queued), len(folders))
 	}
 	for _, folder := range folders {
-		if !queued[folder.ID].reconcile {
+		if queued[folder.ID].kind != syncReconcile {
 			t.Fatalf("folder %q was not queued for full reconciliation", folder.RemoteName)
 		}
 	}
@@ -466,7 +478,7 @@ func TestInboxPollingRunsWhileIdleWatcherIsActive(t *testing.T) {
 	fixture.runtime.scheduleInboxPolling(context.Background())
 	select {
 	case job := <-fixture.runtime.syncHigh:
-		if job.accountID != account.ID || job.folderID != folders[0].ID || job.mailbox != "INBOX" || job.reconcile {
+		if job.accountID != account.ID || job.folderID != folders[0].ID || job.mailbox != "INBOX" || job.kind != syncFolder {
 			t.Fatalf("unexpected Inbox poll job: %#v", job)
 		}
 	default:

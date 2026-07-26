@@ -74,7 +74,11 @@ type FetchRequest struct {
 type SearchRequest struct {
 	Since  time.Time
 	Before time.Time
-	Limit  int
+	// FromUID restricts the search to UID FromUID:*. Servers answer n:* with
+	// the highest-UID message even when n exceeds it, so callers must discard
+	// returned UIDs below FromUID.
+	FromUID uint32
+	Limit   int
 }
 
 type FlagMutation string

@@ -6,10 +6,16 @@ import (
 	"fmt"
 	"time"
 
+	"mailmanager/internal/connectors"
 	"mailmanager/internal/events"
 	"mailmanager/internal/repository"
 	mailSync "mailmanager/internal/sync"
 )
+
+// errSyncBusy marks a background job that found its per-account slot taken
+// and parked itself in bgWaiting; it is not a failure, and the slot holder
+// re-dispatches it on release.
+var errSyncBusy = errors.New("account background sync slot is busy")
 
 func (job syncJob) key() string {
 	switch job.kind {
@@ -19,8 +25,26 @@ func (job syncJob) key() string {
 		return "folder:" + job.accountID + ":" + job.folderID
 	case syncBackfill:
 		return "backfill:" + job.accountID + ":" + job.folderID
+	case syncReconcile:
+		return "reconcile:" + job.accountID + ":" + job.folderID
 	default:
 		return "invalid"
+	}
+}
+
+// timeoutForSyncJob is a backstop against a stalled provider wedging a worker
+// and, through job deduplication, silencing an account's syncs forever. The
+// bounds are far above healthy durations.
+func timeoutForSyncJob(kind syncJobKind) time.Duration {
+	switch kind {
+	case syncDiscover:
+		return 5 * time.Minute
+	case syncReconcile:
+		return time.Hour
+	case syncBackfill:
+		return 2 * time.Hour
+	default:
+		return 30 * time.Minute
 	}
 }
 
@@ -31,7 +55,6 @@ func (r *Runtime) enqueueSync(ctx context.Context, job syncJob) error {
 	key := job.key()
 	r.syncMu.Lock()
 	if current, ok := r.pending[key]; ok {
-		job.reconcile = job.reconcile || current.job.reconcile
 		current.job = job
 		current.rerun = true
 		r.syncMu.Unlock()
@@ -54,7 +77,7 @@ func (r *Runtime) enqueueSync(ctx context.Context, job syncJob) error {
 // to target the same job state.
 func (r *Runtime) dispatchSync(ctx context.Context, job syncJob) error {
 	queue := r.syncHigh
-	if job.kind == syncBackfill {
+	if job.kind == syncBackfill || job.kind == syncReconcile {
 		queue = r.syncLow
 	}
 	select {
@@ -121,6 +144,11 @@ func (r *Runtime) nextSyncJob(ctx context.Context) (syncJob, bool) {
 }
 
 func (r *Runtime) finishSyncJob(ctx context.Context, job syncJob, runErr error) {
+	if errors.Is(runErr, errSyncBusy) {
+		// The job stays pending while parked so deduplication keeps working;
+		// releaseBackgroundSlot dispatches it again.
+		return
+	}
 	key := job.key()
 	r.syncMu.Lock()
 	state := r.pending[key]
@@ -157,24 +185,76 @@ func (r *Runtime) finishSyncJob(ctx context.Context, job syncJob, runErr error) 
 	}()
 }
 
+// acquireBackgroundSlot claims the account's background slot or parks the job
+// until the current holder releases it. Parking under syncMu makes the
+// TryLock-or-park decision atomic with respect to releaseBackgroundSlot.
+func (r *Runtime) acquireBackgroundSlot(job syncJob) bool {
+	lock := r.syncBackgroundLock(job.accountID)
+	r.syncMu.Lock()
+	defer r.syncMu.Unlock()
+	if lock.TryLock() {
+		return true
+	}
+	r.bgWaiting[job.accountID] = append(r.bgWaiting[job.accountID], job)
+	return false
+}
+
+func (r *Runtime) releaseBackgroundSlot(ctx context.Context, accountID string) {
+	r.syncBackgroundLock(accountID).Unlock()
+	r.syncMu.Lock()
+	waiting := r.bgWaiting[accountID]
+	var next *syncJob
+	if len(waiting) > 0 {
+		job := waiting[0]
+		next = &job
+		if len(waiting) == 1 {
+			delete(r.bgWaiting, accountID)
+		} else {
+			r.bgWaiting[accountID] = waiting[1:]
+		}
+	}
+	r.syncMu.Unlock()
+	if next == nil {
+		return
+	}
+	if ctx.Err() != nil {
+		r.dropPendingSync(*next)
+		return
+	}
+	if err := r.dispatchSync(ctx, *next); err != nil {
+		r.dropPendingSync(*next)
+	}
+}
+
 func (r *Runtime) runSyncJob(ctx context.Context, job syncJob) error {
-	lock := r.syncExecutionLock(job.accountID)
-	lock.Lock()
-	defer lock.Unlock()
+	switch job.kind {
+	case syncBackfill, syncReconcile:
+		if !r.acquireBackgroundSlot(job) {
+			return errSyncBusy
+		}
+		defer r.releaseBackgroundSlot(ctx, job.accountID)
+	default:
+		lock := r.syncForegroundLock(job.accountID)
+		lock.Lock()
+		defer lock.Unlock()
+	}
+
+	jobCtx, cancel := context.WithTimeout(ctx, timeoutForSyncJob(job.kind))
+	defer cancel()
 
 	var err error
 	switch job.kind {
 	case syncDiscover:
-		err = r.discoverAccount(ctx, job.accountID)
-	case syncFolder:
-		err = r.syncFolder(ctx, job)
+		err = r.discoverAccount(jobCtx, job.accountID)
+	case syncFolder, syncReconcile:
+		err = r.syncFolder(jobCtx, job)
 	case syncBackfill:
-		err = r.backfillFolder(ctx, job)
+		err = r.backfillFolder(jobCtx, job)
 	default:
 		err = errors.New("unsupported sync job")
 	}
 	if err != nil {
-		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if ctx.Err() != nil {
 			return err
 		}
 		status, code := "error", "sync_failed"
@@ -191,18 +271,19 @@ func (r *Runtime) runSyncJob(ctx context.Context, job syncJob) error {
 	return nil
 }
 
-func (r *Runtime) discoverAccount(ctx context.Context, accountID string) error {
+func (r *Runtime) discoverAccount(ctx context.Context, accountID string) (err error) {
 	_ = r.repository.UpdateAccountStatus(ctx, accountID, "syncing", "")
 	r.events.Publish(events.Event{Type: "sync.progress", ResourceID: accountID, State: "discovering"})
 	config, err := r.accountConfig(ctx, accountID)
 	if err != nil {
 		return err
 	}
-	session, err := r.imapDialer.Dial(ctx, config)
+	pooled, err := r.acquireSession(ctx, accountID, config)
 	if err != nil {
 		return fmt.Errorf("dial IMAP for discovery: %w", err)
 	}
-	defer session.Close()
+	defer func() { r.releaseSession(accountID, pooled, err == nil) }()
+	session := pooled.session
 	capabilities, err := session.Capabilities(ctx)
 	if err != nil {
 		return fmt.Errorf("read IMAP capabilities: %w", err)
@@ -239,16 +320,28 @@ func (r *Runtime) discoverAccount(ctx context.Context, accountID string) error {
 	return nil
 }
 
-func (r *Runtime) syncFolder(ctx context.Context, job syncJob) error {
+func (r *Runtime) syncFolder(ctx context.Context, job syncJob) (err error) {
 	config, err := r.accountConfig(ctx, job.accountID)
 	if err != nil {
 		return err
 	}
-	session, err := r.imapDialer.Dial(ctx, config)
-	if err != nil {
-		return fmt.Errorf("dial IMAP for folder sync: %w", err)
+	var session connectors.IMAPSession
+	if job.kind == syncReconcile {
+		// Reconciles are long; a dedicated connection keeps the pooled
+		// foreground session free for new-mail syncs.
+		session, err = r.imapDialer.Dial(ctx, config)
+		if err != nil {
+			return fmt.Errorf("dial IMAP for folder sync: %w", err)
+		}
+		defer session.Close()
+	} else {
+		pooled, acquireErr := r.acquireSession(ctx, job.accountID, config)
+		if acquireErr != nil {
+			return fmt.Errorf("dial IMAP for folder sync: %w", acquireErr)
+		}
+		defer func() { r.releaseSession(job.accountID, pooled, err == nil) }()
+		session = pooled.session
 	}
-	defer session.Close()
 	checkpoint, err := r.ingest.Checkpoint(ctx, job.accountID, job.folderID)
 	if err != nil {
 		return err
@@ -261,7 +354,7 @@ func (r *Runtime) syncFolder(ctx context.Context, job syncJob) error {
 		AccountID: job.accountID, FolderID: job.folderID, Mailbox: job.mailbox, Provider: config.Provider,
 		Checkpoint: checkpoint, PendingOperationIDs: pending, Now: time.Now().UTC(),
 	}
-	if job.reconcile {
+	if job.kind == syncReconcile {
 		_, err = r.synchronizer.Sync(ctx, session, r.ingest, request)
 	} else {
 		_, err = r.synchronizer.SyncIncremental(ctx, session, r.ingest, request)
@@ -329,6 +422,7 @@ func (r *Runtime) syncScheduler(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-poll.C:
+			r.reapSessions()
 			r.scheduleInboxPolling(ctx)
 		case <-reconcile.C:
 			r.scheduleFolderReconciliation(ctx)
@@ -393,7 +487,7 @@ func (r *Runtime) scheduleFolderReconciliation(ctx context.Context) {
 		for _, folder := range folders {
 			_ = r.enqueueSync(ctx, syncJob{
 				accountID: account.ID, folderID: folder.ID, mailbox: folder.RemoteName,
-				kind: syncFolder, reconcile: true,
+				kind: syncReconcile,
 			})
 		}
 	}
@@ -435,8 +529,12 @@ func (r *Runtime) idleLoop(ctx context.Context, accountID, folderID, mailbox str
 			r.waitIdleRetry(ctx, &failures)
 			continue
 		}
-		caps, err := session.Capabilities(ctx)
+		// The watcher context has no deadline, so bound the setup exchanges
+		// separately: a stalled server must not wedge the watcher forever.
+		setupCtx, cancelSetup := context.WithTimeout(ctx, time.Minute)
+		caps, err := session.Capabilities(setupCtx)
 		if err != nil || !caps.Idle {
+			cancelSetup()
 			_ = session.Close()
 			if err == nil {
 				return
@@ -444,7 +542,9 @@ func (r *Runtime) idleLoop(ctx context.Context, accountID, folderID, mailbox str
 			r.waitIdleRetry(ctx, &failures)
 			continue
 		}
-		if _, err := session.Select(ctx, mailbox, true); err != nil {
+		_, err = session.Select(setupCtx, mailbox, true)
+		cancelSetup()
+		if err != nil {
 			_ = session.Close()
 			r.waitIdleRetry(ctx, &failures)
 			continue

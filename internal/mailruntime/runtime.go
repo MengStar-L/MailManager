@@ -85,6 +85,10 @@ type Runtime struct {
 	syncMu   sync.Mutex
 	pending  map[string]*syncJobState
 	failures map[string]int
+	// bgWaiting parks background jobs whose per-account slot is taken; the
+	// slot holder re-dispatches the next one on release, so contended jobs
+	// chain instead of colliding on retry timers.
+	bgWaiting map[string][]syncJob
 
 	operationWake chan struct{}
 	outboxWake    chan struct{}
@@ -93,8 +97,15 @@ type Runtime struct {
 	idleWatchers map[string]idleWatcher
 	idleSequence uint64
 
-	accountLocks       sync.Map
-	syncExecutionLocks sync.Map
+	accountLocks sync.Map
+	// syncFgLocks serialize quick foreground jobs (discover, inbox and folder
+	// incremental syncs) per account; syncBgLocks serialize long background
+	// jobs (backfill, reconcile) so they never delay new-mail syncs.
+	syncFgLocks sync.Map
+	syncBgLocks sync.Map
+
+	poolMu   sync.Mutex
+	sessions map[string]*pooledSession
 
 	pollInterval      time.Duration
 	reconcileInterval time.Duration
@@ -106,7 +117,6 @@ type syncJob struct {
 	folderID  string
 	mailbox   string
 	kind      syncJobKind
-	reconcile bool
 }
 
 type syncJobKind uint8
@@ -115,6 +125,7 @@ const (
 	syncDiscover syncJobKind = iota + 1
 	syncFolder
 	syncBackfill
+	syncReconcile
 )
 
 type syncJobState struct {
@@ -170,8 +181,9 @@ func New(options Options) (*Runtime, error) {
 		cacheQuotaBytes:    options.AttachmentCacheQuotaBytes,
 		syncHigh:           make(chan syncJob, 256), syncLow: make(chan syncJob, 256),
 		pending: make(map[string]*syncJobState), failures: make(map[string]int),
+		bgWaiting: make(map[string][]syncJob),
 		operationWake: make(chan struct{}, 1), outboxWake: make(chan struct{}, 1),
-		idleWatchers: make(map[string]idleWatcher),
+		idleWatchers: make(map[string]idleWatcher), sessions: make(map[string]*pooledSession),
 		pollInterval: mailSync.InboxPollInterval, reconcileInterval: mailSync.FolderReconcileInterval,
 		queuePollInterval: defaultQueuePoll,
 	}, nil
@@ -245,6 +257,7 @@ func (r *Runtime) Close() {
 	}
 	r.stopAllIdleWatchers()
 	r.wg.Wait()
+	r.closeAllSessions()
 }
 
 func (r *Runtime) Wait() { r.wg.Wait() }
@@ -274,8 +287,13 @@ func (r *Runtime) accountLock(accountID string) *sync.Mutex {
 	return value.(*sync.Mutex)
 }
 
-func (r *Runtime) syncExecutionLock(accountID string) *sync.Mutex {
-	value, _ := r.syncExecutionLocks.LoadOrStore(accountID, &sync.Mutex{})
+func (r *Runtime) syncForegroundLock(accountID string) *sync.Mutex {
+	value, _ := r.syncFgLocks.LoadOrStore(accountID, &sync.Mutex{})
+	return value.(*sync.Mutex)
+}
+
+func (r *Runtime) syncBackgroundLock(accountID string) *sync.Mutex {
+	value, _ := r.syncBgLocks.LoadOrStore(accountID, &sync.Mutex{})
 	return value.(*sync.Mutex)
 }
 

@@ -293,13 +293,16 @@ func (s *Store) ReconcileFolder(ctx context.Context, snapshot mailSync.FolderSna
 			affected[local.conversationID] = struct{}{}
 		}
 
+		// Rows at or above the snapshot's SELECT-time UIDNEXT were stored by
+		// a concurrent incremental sync after the snapshot was captured;
+		// their absence from it is not a deletion.
 		if _, err := tx.ExecContext(ctx, `
 			DELETE FROM message_locations
 			WHERE account_id = ? AND folder_id = ?
-			  AND (uid_validity <> ? OR NOT EXISTS (
+			  AND (uid_validity <> ? OR (uid < ? AND NOT EXISTS (
 				SELECT 1 FROM json_each(?) remote
 				WHERE CAST(remote.value AS INTEGER) = message_locations.uid
-			  ))`, snapshot.AccountID, snapshot.FolderID, snapshot.UIDValidity, remoteUIDsJSON); err != nil {
+			  )))`, snapshot.AccountID, snapshot.FolderID, snapshot.UIDValidity, snapshot.UIDNext, remoteUIDsJSON); err != nil {
 			return err
 		}
 		if err := cleanupOrphanMessages(ctx, tx, snapshot.AccountID); err != nil {
@@ -320,6 +323,9 @@ func validateFolderSnapshot(snapshot mailSync.FolderSnapshot) (map[uint32]connec
 	}
 	if snapshot.UIDValidity == 0 {
 		return nil, "", errors.New("folder snapshot UIDVALIDITY is required")
+	}
+	if snapshot.UIDNext == 0 {
+		return nil, "", errors.New("folder snapshot UIDNEXT is required")
 	}
 	if len(snapshot.RemoteUIDs) > maximumFolderSnapshotUIDs {
 		return nil, "", fmt.Errorf("folder snapshot cannot exceed %d UIDs", maximumFolderSnapshotUIDs)
@@ -422,17 +428,28 @@ func (s *Store) StoreMessages(ctx context.Context, batch mailSync.MessageBatch) 
 
 func (s *Store) CompleteFolder(ctx context.Context, checkpoint mailSync.Checkpoint) error {
 	return s.database.WriteTx(ctx, func(tx *sql.Tx) error {
+		// last_uid must never move backwards within a UIDVALIDITY generation:
+		// a long reconcile completing after concurrent incremental syncs
+		// would otherwise rewind the checkpoint and force refetches.
 		_, err := tx.ExecContext(ctx, `
-			UPDATE sync_checkpoints SET uid_validity = ?, last_uid = ?, highest_modseq = ?, body_refresh_required = ?, state = 'idle',
+			UPDATE sync_checkpoints SET
+			       last_uid = CASE WHEN uid_validity = ? THEN MAX(COALESCE(last_uid, 0), ?) ELSE ? END,
+			       uid_validity = ?, highest_modseq = ?, body_refresh_required = ?, state = 'idle',
 			       last_success_at = ?, last_error_code = NULL, updated_at = ?
 			WHERE account_id = ? AND folder_id = ?`,
-			checkpoint.UIDValidity, checkpoint.LastUID, checkpoint.HighestModSeq, checkpoint.BodyRefreshRequired,
+			checkpoint.UIDValidity, checkpoint.LastUID, checkpoint.LastUID,
+			checkpoint.UIDValidity, checkpoint.HighestModSeq, checkpoint.BodyRefreshRequired,
 			checkpoint.UpdatedAt.UnixMilli(), checkpoint.UpdatedAt.UnixMilli(), checkpoint.AccountID, checkpoint.FolderID)
 		if err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE folders SET uid_validity = ?, uid_next = ?, highest_modseq = ?, updated_at = ? WHERE id = ?`,
-			checkpoint.UIDValidity, checkpoint.UIDNext, checkpoint.HighestModSeq, checkpoint.UpdatedAt.UnixMilli(), checkpoint.FolderID)
+		_, err = tx.ExecContext(ctx, `
+			UPDATE folders SET
+			       uid_next = CASE WHEN uid_validity = ? THEN MAX(COALESCE(uid_next, 0), ?) ELSE ? END,
+			       uid_validity = ?, highest_modseq = ?, updated_at = ?
+			WHERE id = ?`,
+			checkpoint.UIDValidity, checkpoint.UIDNext, checkpoint.UIDNext,
+			checkpoint.UIDValidity, checkpoint.HighestModSeq, checkpoint.UpdatedAt.UnixMilli(), checkpoint.FolderID)
 		return err
 	})
 }

@@ -192,6 +192,13 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 		}
 		principal, err := s.auth.Authenticate(r.Context(), cookie.Value)
 		if err != nil {
+			// A transient storage error must not destroy a valid session:
+			// clearing cookies here would also permanently close the
+			// browser's event stream.
+			if !errors.Is(err, auth.ErrSessionInvalid) {
+				WriteError(w, r, http.StatusServiceUnavailable, "session_check_failed", "服务暂时不可用，请稍后重试")
+				return
+			}
 			http.SetCookie(w, auth.ClearSessionCookie(s.secureCookies))
 			http.SetCookie(w, auth.ClearCSRFCookie(s.secureCookies))
 			WriteError(w, r, http.StatusUnauthorized, "session_expired", "登录已失效，请重新登录")

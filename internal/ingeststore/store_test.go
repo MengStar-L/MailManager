@@ -159,7 +159,7 @@ func TestReconcileFolderUpdatesFlagsAndDeletesExpungedOrphans(t *testing.T) {
 	defer database.Close()
 
 	received := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
-	for _, uid := range []uint32{5, 6} {
+	for _, uid := range []uint32{5, 6, 8} {
 		message := connectors.RemoteMessage{
 			UID: uid, InternalDate: received.Add(time.Duration(uid) * time.Minute), RFC822Size: 100,
 			Envelope: connectors.RemoteEnvelope{
@@ -177,8 +177,10 @@ func TestReconcileFolderUpdatesFlagsAndDeletesExpungedOrphans(t *testing.T) {
 		}
 	}
 
+	// UID 8 sits at the snapshot's UIDNEXT: it arrived after the snapshot was
+	// captured (stored by a concurrent incremental sync) and must survive.
 	if err := ingest.ReconcileFolder(ctx, mailSync.FolderSnapshot{
-		AccountID: accountID, FolderID: folderID, UIDValidity: 42,
+		AccountID: accountID, FolderID: folderID, UIDValidity: 42, UIDNext: 8,
 		RemoteUIDs: []uint32{5},
 		States:     []connectors.RemoteMessageState{{UID: 5, Flags: []string{`\Seen`}, ModSeq: 9}},
 	}); err != nil {
@@ -203,14 +205,15 @@ func TestReconcileFolderUpdatesFlagsAndDeletesExpungedOrphans(t *testing.T) {
 
 	assertCount(t, database.DB(), `SELECT COUNT(*) FROM message_locations WHERE folder_id = ? AND uid = 6`, 0, folderID)
 	assertCount(t, database.DB(), `SELECT COUNT(*) FROM messages WHERE rfc_message_id = '<state-6@example.com>'`, 0)
-	assertCount(t, database.DB(), `SELECT COUNT(*) FROM message_search WHERE body_tokens MATCH 'searchable'`, 1)
+	assertCount(t, database.DB(), `SELECT COUNT(*) FROM message_locations WHERE folder_id = ? AND uid = 8`, 1, folderID)
+	assertCount(t, database.DB(), `SELECT COUNT(*) FROM message_search WHERE body_tokens MATCH 'searchable'`, 2)
 
 	items, _, err := repo.ListConversations(ctx, repository.ConversationQuery{InboxOnly: true, Limit: 50})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(items) != 1 || items[0].UnreadCount != 0 {
-		t.Fatalf("unexpected conversations after reconciliation: %#v", items)
+	if len(items) != 2 || items[0].UnreadCount != 1 || items[1].UnreadCount != 0 {
+		t.Fatalf("unexpected conversations after reconciliation (UID 5 read, post-snapshot UID 8 unread, UID 6 gone): %#v", items)
 	}
 }
 

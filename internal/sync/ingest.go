@@ -47,8 +47,13 @@ type FolderSnapshot struct {
 	AccountID   string
 	FolderID    string
 	UIDValidity uint32
-	RemoteUIDs  []uint32
-	States      []connectors.RemoteMessageState
+	// UIDNext is the SELECT-time UIDNEXT of the session that captured the
+	// snapshot. Messages at or above it arrived after the capture and may
+	// have been stored by a concurrent incremental sync, so applying the
+	// snapshot must not treat their absence as a deletion.
+	UIDNext    uint32
+	RemoteUIDs []uint32
+	States     []connectors.RemoteMessageState
 }
 
 // IngestSink is implemented by storage as an atomic boundary. PrepareFolder
@@ -114,11 +119,14 @@ func (s FolderSynchronizer) sync(ctx context.Context, session IngestSession, sin
 		return Checkpoint{}, errors.New("ingest batch size cannot exceed 1000")
 	}
 
+	incrementalProbe := false
+	var highestFetched uint32
 	if request.Checkpoint.BodyRefreshRequired {
 		uids, err := session.SearchUIDs(ctx, connectors.SearchRequest{Limit: maximumInitialUIDs})
 		if err != nil {
 			return Checkpoint{}, fmt.Errorf("search messages for body refresh: %w", err)
 		}
+		highestFetched = maxUID(uids)
 		if err := s.fetchExplicitBatches(ctx, session, sink, request, state.UIDValidity, uids, batchSize, false); err != nil {
 			return Checkpoint{}, err
 		}
@@ -128,24 +136,49 @@ func (s FolderSynchronizer) sync(ctx context.Context, session IngestSession, sin
 		if err != nil {
 			return Checkpoint{}, fmt.Errorf("search recent messages: %w", err)
 		}
+		highestFetched = maxUID(uids)
 		if err := s.fetchExplicitBatches(ctx, session, sink, request, state.UIDValidity, uids, batchSize, false); err != nil {
 			return Checkpoint{}, err
 		}
-	} else if state.UIDNext > 1 && decision.FetchFromUID < state.UIDNext {
-		if err := s.fetchRangeBatches(ctx, session, sink, request, state.UIDValidity, decision.FetchFromUID, state.UIDNext-1, batchSize); err != nil {
+	} else {
+		// Probe for actual new UIDs instead of trusting the SELECT-reported
+		// UIDNEXT, which some providers (163/QQ) report stale or omit. A
+		// server answers n:* with its highest-UID message even when n exceeds
+		// it, so already-covered UIDs must be discarded.
+		incrementalProbe = true
+		uids, err := session.SearchUIDs(ctx, connectors.SearchRequest{FromUID: decision.FetchFromUID, Limit: maximumInitialUIDs})
+		if err != nil {
+			return Checkpoint{}, fmt.Errorf("search new messages: %w", err)
+		}
+		fresh := make([]uint32, 0, len(uids))
+		for _, uid := range uids {
+			if uid >= decision.FetchFromUID {
+				fresh = append(fresh, uid)
+			}
+		}
+		highestFetched = maxUID(fresh)
+		if err := s.fetchExplicitBatches(ctx, session, sink, request, state.UIDValidity, fresh, batchSize, false); err != nil {
 			return Checkpoint{}, err
 		}
 	}
 	if reconcile {
-		if err := s.reconcileFolder(ctx, session, sink, request, state.UIDValidity, batchSize); err != nil {
+		if err := s.reconcileFolder(ctx, session, sink, request, state, batchSize); err != nil {
 			return Checkpoint{}, err
 		}
 	}
 
 	next := decision.Checkpoint
 	next.BodyRefreshRequired = false
-	if state.UIDNext > 0 {
+	if incrementalProbe {
+		// Advance only over UIDs that were actually stored so a message the
+		// server exposes late is fetched by a later probe instead of being
+		// skipped forever.
+		next.LastUID = request.Checkpoint.LastUID
+	} else if state.UIDNext > 0 {
 		next.LastUID = state.UIDNext - 1
+	}
+	if highestFetched > next.LastUID {
+		next.LastUID = highestFetched
 	}
 	next.HighestModSeq = state.HighestModSeq
 	next.UpdatedAt = request.Now.UTC()
@@ -153,6 +186,16 @@ func (s FolderSynchronizer) sync(ctx context.Context, session IngestSession, sin
 		return Checkpoint{}, fmt.Errorf("complete folder sync: %w", err)
 	}
 	return next, nil
+}
+
+func maxUID(uids []uint32) uint32 {
+	var maximum uint32
+	for _, uid := range uids {
+		if uid > maximum {
+			maximum = uid
+		}
+	}
+	return maximum
 }
 
 func (s FolderSynchronizer) BackfillHistory(ctx context.Context, session IngestSession, sink IngestSink, request FolderSyncRequest) error {
@@ -206,35 +249,6 @@ func (s FolderSynchronizer) fetchExplicitBatches(
 		if err := s.storeFetchedMessages(ctx, session, sink, request, uidValidity, messages, lowPriority); err != nil {
 			return err
 		}
-	}
-	return nil
-}
-
-func (s FolderSynchronizer) fetchRangeBatches(
-	ctx context.Context,
-	session IngestSession,
-	sink IngestSink,
-	request FolderSyncRequest,
-	uidValidity, from, through uint32,
-	batchSize int,
-) error {
-	for start := from; start <= through; {
-		end64 := uint64(start) + uint64(batchSize) - 1
-		if end64 > uint64(through) {
-			end64 = uint64(through)
-		}
-		end := uint32(end64)
-		messages, err := session.FetchMessages(ctx, connectors.FetchRequest{FromUID: start, ThroughUID: end, Limit: batchSize})
-		if err != nil {
-			return fmt.Errorf("fetch incremental IMAP batch: %w", err)
-		}
-		if err := s.storeFetchedMessages(ctx, session, sink, request, uidValidity, messages, false); err != nil {
-			return err
-		}
-		if end == through {
-			break
-		}
-		start = end + 1
 	}
 	return nil
 }
@@ -322,7 +336,7 @@ func (s FolderSynchronizer) reconcileFolder(
 	session IngestSession,
 	sink IngestSink,
 	request FolderSyncRequest,
-	uidValidity uint32,
+	state connectors.MailboxState,
 	batchSize int,
 ) error {
 	uids, err := session.SearchUIDs(ctx, connectors.SearchRequest{Limit: maximumInitialUIDs})
@@ -344,8 +358,8 @@ func (s FolderSynchronizer) reconcileFolder(
 		states = append(states, batch...)
 	}
 	if err := sink.ReconcileFolder(ctx, FolderSnapshot{
-		AccountID: request.AccountID, FolderID: request.FolderID, UIDValidity: uidValidity,
-		RemoteUIDs: uids, States: states,
+		AccountID: request.AccountID, FolderID: request.FolderID, UIDValidity: state.UIDValidity,
+		UIDNext: state.UIDNext, RemoteUIDs: uids, States: states,
 	}); err != nil {
 		return fmt.Errorf("reconcile folder state: %w", err)
 	}

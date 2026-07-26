@@ -8,6 +8,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/emersion/go-imap/v2"
@@ -28,6 +29,7 @@ func (s *emersionIMAPSession) ListMailboxes(ctx context.Context) ([]RemoteMailbo
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	defer s.guard(ctx)()
 	caps := s.client.Caps()
 	options := &imap.ListOptions{}
 	if caps != nil && caps.Has(imap.CapSpecialUse) {
@@ -72,15 +74,27 @@ func (s *emersionIMAPSession) SearchUIDs(ctx context.Context, request SearchRequ
 	if limit > maximumSearchUIDs {
 		return nil, fmt.Errorf("search limit cannot exceed %d", maximumSearchUIDs)
 	}
-	data, err := s.client.UIDSearch(&imap.SearchCriteria{
-		Since: request.Since.UTC(), Before: request.Before.UTC(),
-	}, nil).Wait()
+	criteria := &imap.SearchCriteria{Since: request.Since.UTC(), Before: request.Before.UTC()}
+	if request.FromUID != 0 {
+		var set imap.UIDSet
+		set.AddRange(imap.UID(request.FromUID), 0)
+		criteria.UID = []imap.UIDSet{set}
+	}
+	defer s.guard(ctx)()
+	data, err := s.client.UIDSearch(criteria, nil).Wait()
 	if err != nil {
 		return nil, fmt.Errorf("search IMAP messages: %w", err)
 	}
 	uids := data.AllUIDs()
 	if len(uids) > limit {
-		return nil, fmt.Errorf("search returned %d UIDs, exceeding limit %d", len(uids), limit)
+		if request.FromUID == 0 {
+			return nil, fmt.Errorf("search returned %d UIDs, exceeding limit %d", len(uids), limit)
+		}
+		// An incremental probe over a huge backlog must make forward
+		// progress instead of failing forever: keep the lowest UIDs so the
+		// caller's checkpoint advances and later probes cover the rest.
+		sort.Slice(uids, func(i, j int) bool { return uids[i] < uids[j] })
+		uids = uids[:limit]
 	}
 	result := make([]uint32, len(uids))
 	for index, uid := range uids {
@@ -110,6 +124,7 @@ func (s *emersionIMAPSession) FetchMessages(ctx context.Context, request FetchRe
 			return nil, errors.New("CHANGEDSINCE requires the CONDSTORE capability")
 		}
 	}
+	defer s.guard(ctx)()
 	caps := s.client.Caps()
 	fetchGmailMessageID := s.provider == accounts.ProviderGoogle && caps != nil && caps.Has(imap.Cap("X-GM-EXT-1"))
 	headerSection := &imap.FetchItemBodySection{
@@ -170,6 +185,7 @@ func (s *emersionIMAPSession) FetchMessageStates(ctx context.Context, request Fe
 	if err != nil {
 		return nil, err
 	}
+	defer s.guard(ctx)()
 	caps := s.client.Caps()
 	includeModSeq := caps != nil && caps.Has(imap.CapCondStore)
 	command := s.client.Fetch(set, &imap.FetchOptions{
@@ -480,6 +496,7 @@ func (s *emersionIMAPSession) fetchBodySections(ctx context.Context, uid uint32,
 	if uid == 0 {
 		return nil, errors.New("message UID must be non-zero")
 	}
+	defer s.guard(ctx)()
 	command := s.client.Fetch(imap.UIDSetNum(imap.UID(uid)), &imap.FetchOptions{UID: true, BodySection: sections})
 	result := make([][]byte, len(sections))
 	found := make([]bool, len(sections))
@@ -564,6 +581,7 @@ func (s *emersionIMAPSession) StoreFlags(ctx context.Context, uids []uint32, mut
 	default:
 		return fmt.Errorf("unsupported flag mutation %q", mutation)
 	}
+	defer s.guard(ctx)()
 	if err := s.client.Store(set, &imap.StoreFlags{Op: operation, Silent: true, Flags: imapFlags}, nil).Close(); err != nil {
 		return fmt.Errorf("store IMAP flags: %w", err)
 	}
@@ -595,6 +613,7 @@ func (s *emersionIMAPSession) Copy(ctx context.Context, uids []uint32, destinati
 	if destination == "" {
 		return CopyResult{}, errors.New("destination mailbox is required")
 	}
+	defer s.guard(ctx)()
 	data, err := s.client.Copy(set, destination).Wait()
 	if err != nil {
 		return CopyResult{}, fmt.Errorf("copy IMAP messages: %w", err)
@@ -622,6 +641,7 @@ func (s *emersionIMAPSession) Delete(ctx context.Context, uids []uint32, expunge
 	if !expunge {
 		return nil
 	}
+	defer s.guard(ctx)()
 	if _, err := s.client.UIDExpunge(set).Collect(); err != nil {
 		return fmt.Errorf("selectively expunge IMAP messages: %w", err)
 	}
@@ -664,12 +684,15 @@ func (s *emersionIMAPSession) Idle(ctx context.Context) (IMAPEvent, error) {
 	}
 	select {
 	case event := <-s.events:
-		if err := stopIdle(command); err != nil {
-			return IMAPEvent{}, err
+		if err := s.stopIdle(command); err != nil {
+			// The event already arrived; surface it so the caller schedules
+			// its sync, and let the next call fail fast on the closed
+			// connection instead of dropping new mail.
+			_ = s.client.Close()
 		}
 		return event, nil
 	case <-ctx.Done():
-		if err := stopIdle(command); err != nil {
+		if err := s.stopIdle(command); err != nil {
 			return IMAPEvent{}, err
 		}
 		return IMAPEvent{}, ctx.Err()
@@ -678,14 +701,26 @@ func (s *emersionIMAPSession) Idle(ctx context.Context) (IMAPEvent, error) {
 	}
 }
 
-func stopIdle(command *imapclient.IdleCommand) error {
+// stopIdle ends the IDLE command, forcing the connection closed when the
+// server does not answer DONE within a short grace period.
+func (s *emersionIMAPSession) stopIdle(command *imapclient.IdleCommand) error {
 	if err := command.Close(); err != nil {
 		return fmt.Errorf("stop IMAP IDLE: %w", err)
 	}
-	if err := command.Wait(); err != nil {
-		return fmt.Errorf("finish IMAP IDLE: %w", err)
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	timer := time.NewTimer(10 * time.Second)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("finish IMAP IDLE: %w", err)
+		}
+		return nil
+	case <-timer.C:
+		_ = s.client.Close()
+		return errors.New("IMAP IDLE DONE handshake timed out")
 	}
-	return nil
 }
 
 func (s *emersionIMAPSession) handleExpungeEvent(sequence uint32) {

@@ -10,6 +10,7 @@ import (
 	"net"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -50,6 +51,7 @@ type MoveResult struct {
 type IMAPSession interface {
 	Capabilities(context.Context) (IMAPCapabilities, error)
 	ListMailboxes(context.Context) ([]RemoteMailbox, error)
+	Noop(context.Context) error
 	Select(context.Context, string, bool) (MailboxState, error)
 	SearchUIDs(context.Context, SearchRequest) ([]uint32, error)
 	FetchMessages(context.Context, FetchRequest) ([]RemoteMessage, error)
@@ -105,7 +107,6 @@ func (d EmersionIMAPDialer) Dial(ctx context.Context, config accounts.Config) (I
 	session := &emersionIMAPSession{provider: config.Provider, events: make(chan IMAPEvent, 128)}
 	options := &imapclient.Options{
 		TLSConfig:   tlsConfig,
-		Dialer:      &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second},
 		WordDecoder: &mime.WordDecoder{CharsetReader: charset.Reader},
 		UnilateralDataHandler: &imapclient.UnilateralDataHandler{
 			Expunge: session.handleExpungeEvent,
@@ -113,20 +114,54 @@ func (d EmersionIMAPDialer) Dial(ctx context.Context, config accounts.Config) (I
 			Fetch:   session.handleFetchEvent,
 		},
 	}
+	// The connection is dialed here rather than through the library's Dial
+	// helpers so the handshake watchdog below holds the raw conn: a server
+	// that accepts and then stalls (a known throttling mode) can wedge any
+	// point from STARTTLS negotiation to LOGIN, none of which carry a read
+	// deadline of their own.
+	netDialer := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
 	var (
-		client *imapclient.Client
-		err    error
+		conn net.Conn
+		err  error
 	)
 	switch config.IMAP.TLSMode {
 	case accounts.TLSImplicit:
-		client, err = imapclient.DialTLS(config.IMAP.Address(), options)
+		implicitConfig := tlsConfig.Clone()
+		if implicitConfig.NextProtos == nil {
+			implicitConfig.NextProtos = []string{"imap"}
+		}
+		conn, err = tls.DialWithDialer(netDialer, "tcp", config.IMAP.Address(), implicitConfig)
 	case accounts.TLSStartTLS:
-		client, err = imapclient.DialStartTLS(config.IMAP.Address(), options)
+		conn, err = netDialer.DialContext(ctx, "tcp", config.IMAP.Address())
 	default:
 		return nil, fmt.Errorf("unsupported IMAP TLS mode %q", config.IMAP.TLSMode)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("connect to IMAP server: %w", err)
+	}
+	handshakeDone := make(chan struct{})
+	defer close(handshakeDone)
+	go func() {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case <-handshakeDone:
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-timer.C:
+			_ = conn.Close()
+		}
+	}()
+	var client *imapclient.Client
+	switch config.IMAP.TLSMode {
+	case accounts.TLSImplicit:
+		client = imapclient.New(conn, options)
+	default:
+		client, err = imapclient.NewStartTLS(conn, options)
+		if err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("negotiate STARTTLS with IMAP server: %w", err)
+		}
 	}
 	closeOnError := true
 	defer func() {
@@ -191,10 +226,55 @@ type emersionIMAPSession struct {
 	overflow atomic.Bool
 }
 
+// guard closes the connection when ctx ends before the guarded protocol
+// exchange finishes. Command waits in the underlying library have no read
+// deadline, so this is the only bound on a stalled server mid-session.
+func (s *emersionIMAPSession) guard(ctx context.Context) func() {
+	if ctx.Done() == nil {
+		return func() {}
+	}
+	stop := make(chan struct{})
+	// finished makes command completion authoritative: callers often cancel
+	// ctx immediately after a successful command, and without it a
+	// not-yet-scheduled goroutine could pick the ctx.Done case and close a
+	// healthy (possibly pooled) connection.
+	var finished sync.Mutex
+	completed := false
+	go func() {
+		select {
+		case <-ctx.Done():
+			finished.Lock()
+			if !completed {
+				_ = s.client.Close()
+			}
+			finished.Unlock()
+		case <-stop:
+		}
+	}()
+	return func() {
+		finished.Lock()
+		completed = true
+		finished.Unlock()
+		close(stop)
+	}
+}
+
+func (s *emersionIMAPSession) Noop(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	defer s.guard(ctx)()
+	if err := s.client.Noop().Wait(); err != nil {
+		return fmt.Errorf("IMAP NOOP: %w", err)
+	}
+	return nil
+}
+
 func (s *emersionIMAPSession) Capabilities(ctx context.Context) (IMAPCapabilities, error) {
 	if err := ctx.Err(); err != nil {
 		return IMAPCapabilities{}, err
 	}
+	defer s.guard(ctx)()
 	caps, err := s.client.Capability().Wait()
 	if err != nil {
 		return IMAPCapabilities{}, fmt.Errorf("query IMAP capabilities: %w", err)
@@ -220,6 +300,7 @@ func (s *emersionIMAPSession) Select(ctx context.Context, mailbox string, readOn
 	if mailbox == "" {
 		return MailboxState{}, errors.New("mailbox name is required")
 	}
+	defer s.guard(ctx)()
 	data, err := s.client.Select(mailbox, &imap.SelectOptions{ReadOnly: readOnly}).Wait()
 	if err != nil {
 		return MailboxState{}, fmt.Errorf("select IMAP mailbox %q: %w", mailbox, err)
@@ -270,6 +351,7 @@ func (s *emersionIMAPSession) Move(ctx context.Context, uids []uint32, destinati
 	if err != nil {
 		return MoveResult{}, err
 	}
+	defer s.guard(ctx)()
 	caps, err := s.client.Capability().Wait()
 	if err != nil {
 		return MoveResult{}, fmt.Errorf("query IMAP capabilities before move: %w", err)
@@ -304,10 +386,19 @@ func uidSetNumbers(set imap.NumSet) []uint32 {
 }
 
 func (s *emersionIMAPSession) Close() error {
-	if err := s.client.Logout().Wait(); err != nil {
+	done := make(chan error, 1)
+	go func() { done <- s.client.Logout().Wait() }()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		if err != nil {
+			return s.client.Close()
+		}
+		return nil
+	case <-timer.C:
 		return s.client.Close()
 	}
-	return nil
 }
 
 type xoauth2SASL struct {

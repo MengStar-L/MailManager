@@ -130,6 +130,9 @@ export function AuthGate({ children }: { children: ReactNode }) {
   if (setup.isPending || (setup.data?.setup_required === false && session.isPending)) return <FullPageLoader />;
   if (setup.isError) return <main className="center-page"><ErrorState title="无法连接 MailManager" message={friendlyError(setup.error)} onRetry={() => setup.refetch()} /></main>;
   if (setup.data?.setup_required) return <SetupScreen onComplete={refresh} />;
+  // A failed session check (e.g. 503 during a transient storage error) is not
+  // a logged-out state; showing the login form would tempt a needless re-auth.
+  if (session.isError) return <main className="center-page"><ErrorState title="无法确认登录状态" message={friendlyError(session.error)} onRetry={() => session.refetch()} /></main>;
   if (!session.data?.authenticated) return <LoginScreen onComplete={refresh} />;
   return children;
 }

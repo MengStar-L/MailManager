@@ -41,6 +41,7 @@ func (s *emersionIMAPSession) Append(
 	if !timestamp.IsZero() {
 		timestamp = timestamp.UTC()
 	}
+	defer s.guard(ctx)()
 	command := s.client.Append(mailbox, int64(len(message)), &imap.AppendOptions{
 		Flags: imapFlags,
 		Time:  timestamp,
